@@ -8,7 +8,7 @@ from omegaconf import DictConfig, OmegaConf
 import diffdope as dd
 
 
-@hydra.main(version_base=None, config_path="../configs/", config_name="diffdope")
+@hydra.main(version_base=None, config_path="../configs/", config_name="bulldozer")
 def main(cfg: DictConfig):
     # load the optimization through the diffdope config file
     ddope = dd.DiffDope(cfg=cfg)

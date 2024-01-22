@@ -1,0 +1,43 @@
+---
+camera:
+    fx: 609.8634
+    fy: 609.95593
+    cx: 312.70883
+    cy: 240.19435
+    im_width: 640
+    im_height: 480
+scene:
+    path_img: /tmp/docker/bulldozer2-imgs/001.png
+    path_depth: /tmp/docker/bulldozer2-imgs/depth/001.png
+    path_segmentation: /tmp/docker/bulldozer2-imgs/mask/000.png
+    image_resize: 0.25
+object3d:
+    position: [0.11132171, 0.02492679, 0.4459777 ]
+    scale: 1.00
+    # rotation can be a quaternion, matrix 3x3 flatten or not
+    rotation: [ 0.6427876 ,  0.26198718,  0.71931569,  0.        , -0.939     ,
+        0.342     ,  0.7660444 , -0.21983336, -0.60357756]
+    model_path: /tmp/docker/bulldozer_normalized/bulldozer_normalized.obj
+losses:
+    l1_rgb_with_mask: true
+    weight_rgb: 0.7
+    l1_depth_with_mask: true
+    weight_depth: 1.0
+    l1_mask: false
+    weight_mask: 1.0
+hyperparameters:
+    nb_iterations: 256
+    batchsize: 128
+    base_lr: 20
+    learning_rates_bound: [0.01, 100]
+    learning_rate_base: 1
+    lr_decay: 0.1
+render_images:
+    nrow: 4
+    final_width_batch: 2000
+    add_background: true
+    alpha_overlay: 0.7
+    add_countour: true
+    color_countour: [0.46, 0.73, 0]
+    flip_result: true
+    crop_around_mask: true

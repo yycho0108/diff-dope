@@ -25,6 +25,9 @@ import numpy as np
 import nvdiffrast.torch as dr
 import pyrr
 import torch
+import torch as th
+import torch.nn as nn
+import einops
 import trimesh
 from icecream import ic
 from omegaconf import DictConfig, OmegaConf
@@ -33,6 +36,11 @@ from PIL import ImageColor, ImageDraw, ImageFont
 from tqdm import tqdm
 
 import diffdope as dd
+from pkm.util.torch_util import dcn
+from pkm.util.math_util import (
+        r6_from_quat,
+        matrix_from_r6,
+        )
 
 # for better print debug
 print()
@@ -42,8 +50,13 @@ if not hasattr(sys, 'ps1'):
 # A logger for this file
 log = logging.getLogger(__name__)
 
+# adjust rotation parameterization
+RTYPE = 'r6'
+# adjust rotation parameter 'sensitivity'
+# higher scale = more sensitive (i.e. more likely to change)
+SCALE = 10.0
 
-def matrix_batch_44_from_position_quat(q, p):
+def matrix_batch_44_from_position_quat(p, q=None, r6=None):
     """
     Convert a batched position and quaternion into a batch matrix while keeping the gradients intact.
 
@@ -54,31 +67,34 @@ def matrix_batch_44_from_position_quat(q, p):
     Return:
         returns a (batch,4,4) torch tensor that keeps the gradients intact
     """
-    r0 = torch.stack(
-        [
-            1.0 - 2.0 * q[:, 1] ** 2 - 2.0 * q[:, 2] ** 2,
-            2.0 * q[:, 0] * q[:, 1] - 2.0 * q[:, 2] * q[:, 3],
-            2.0 * q[:, 0] * q[:, 2] + 2.0 * q[:, 1] * q[:, 3],
-        ],
-        dim=1,
-    )
-    r1 = torch.stack(
-        [
-            2.0 * q[:, 0] * q[:, 1] + 2.0 * q[:, 2] * q[:, 3],
-            1.0 - 2.0 * q[:, 0] ** 2 - 2.0 * q[:, 2] ** 2,
-            2.0 * q[:, 1] * q[:, 2] - 2.0 * q[:, 0] * q[:, 3],
-        ],
-        dim=1,
-    )
-    r2 = torch.stack(
-        [
-            2.0 * q[:, 0] * q[:, 2] - 2.0 * q[:, 1] * q[:, 3],
-            2.0 * q[:, 1] * q[:, 2] + 2.0 * q[:, 0] * q[:, 3],
-            1.0 - 2.0 * q[:, 0] ** 2 - 2.0 * q[:, 1] ** 2,
-        ],
-        dim=1,
-    )
-    rr = torch.stack([r0, r1, r2], dim=1)
+    if q is not None:
+        r0 = torch.stack(
+            [
+                1.0 - 2.0 * q[:, 1] ** 2 - 2.0 * q[:, 2] ** 2,
+                2.0 * q[:, 0] * q[:, 1] - 2.0 * q[:, 2] * q[:, 3],
+                2.0 * q[:, 0] * q[:, 2] + 2.0 * q[:, 1] * q[:, 3],
+            ],
+            dim=1,
+        )
+        r1 = torch.stack(
+            [
+                2.0 * q[:, 0] * q[:, 1] + 2.0 * q[:, 2] * q[:, 3],
+                1.0 - 2.0 * q[:, 0] ** 2 - 2.0 * q[:, 2] ** 2,
+                2.0 * q[:, 1] * q[:, 2] - 2.0 * q[:, 0] * q[:, 3],
+            ],
+            dim=1,
+        )
+        r2 = torch.stack(
+            [
+                2.0 * q[:, 0] * q[:, 2] - 2.0 * q[:, 1] * q[:, 3],
+                2.0 * q[:, 1] * q[:, 2] + 2.0 * q[:, 0] * q[:, 3],
+                1.0 - 2.0 * q[:, 0] ** 2 - 2.0 * q[:, 1] ** 2,
+            ],
+            dim=1,
+        )
+        rr = torch.stack([r0, r1, r2], dim=1)
+    else:
+        rr = matrix_from_r6(r6 * SCALE)
     aa = torch.stack([p[:, 0], p[:, 1], p[:, 2]], dim=1).reshape(-1, 3, 1)
     rr = torch.cat([rr, aa], dim=2)  # Pad right column.
     aa = torch.stack(
@@ -100,8 +116,10 @@ def opencv_2_opengl(p, q):
     Returns:
         p,q
     """
-    source_transform = q.matrix44
-    source_transform[:3, 3] = p
+    # source_transform = q.matrix44
+    # source_transform[:3, 3] = p
+    print(pyrr.Matrix44.from_translation(p))
+    source_transform = q.matrix44 @ pyrr.Matrix44.from_translation(p)
     opengl_to_opencv = np.array(
         [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]]
     )
@@ -113,13 +131,18 @@ def opencv_2_opengl(p, q):
     # Adjust rotation and translation for target coordinate system
     adjusted_rotation = np.dot(R_opengl_to_opencv, source_transform[:3, :3])
     adjusted_translation = (
-        np.dot(R_opengl_to_opencv, source_transform[:3, 3]) + t_opengl_to_opencv
+            np.dot(R_opengl_to_opencv, source_transform[3, :3]) + t_opengl_to_opencv
     )
+    # print(p)
+    # print(source_transform[:3, 3])
+    # print(np.dot(R_opengl_to_opencv, source_transform[:3, 3]))
+    # print(R_opengl_to_opencv)
+    # print(adjusted_translation)
 
     # Build target transformation matrix (OpenCV convention)
     target_transform = np.eye(4)
     target_transform[:3, :3] = adjusted_rotation
-    target_transform[:3, 3] = adjusted_translation
+    target_transform[3, :3] = adjusted_translation
 
     q = pyrr.Matrix44(target_transform).quaternion
 
@@ -136,8 +159,9 @@ def opencv_2_opengl(p, q):
         * pyrr.Quaternion.from_x_rotation(-np.pi / 2)
     )
     # END TODO
+    print(target_transform[3, :3])
 
-    return target_transform[:3, 3], q
+    return target_transform[3, :3], q
 
 
 def interpolate(attr, rast, attr_idx, rast_db=None):
@@ -189,7 +213,10 @@ def render_texture_batch(
     """
     if not type(resolution) == list:
         resolution = [resolution, resolution]
-    posw = torch.cat([pos, torch.ones([pos.shape[0], pos.shape[1], 1]).cuda()], axis=2)
+    # print('pos', pos.shape)
+    # posw = torch.cat([pos, torch.ones([pos.shape[0], pos.shape[1], 1]).cuda()], axis=2)
+    # print('posw', posw.shape)
+    posw = nn.functional.pad(pos, (0, 1), mode='constant', value=1)
     mtx_transpose = torch.transpose(mtx, 1, 2)
 
     final_mtx_proj = torch.matmul(proj_cam, mtx)
@@ -209,9 +236,13 @@ def render_texture_batch(
     depth = depth.reshape(shape_keep)[..., 2] * -1
 
     # mask   , _ = dr.interpolate(torch.ones(pos_idx.shape).cuda(), rast_out, pos_idx)
-    mask, _ = dr.interpolate(torch.ones(pos_idx.shape).cuda(), 
-        rast_out, pos_idx[0],rast_db=rast_out_db,diff_attrs="all")
-    mask       = dr.antialias(mask, rast_out, pos_clip_ja, pos_idx[0])
+    mask = None
+    if False:
+        mask, _ = dr.interpolate(
+                # torch.ones(pos_idx.shape).cuda(), 
+                th.ones(pos_idx.shape, device='cuda'),
+            rast_out, pos_idx[0],rast_db=rast_out_db,diff_attrs="all")
+        mask       = dr.antialias(mask, rast_out, pos_clip_ja, pos_idx[0])
 
     # compute vertex color interpolation
     if vtx_color is None:
@@ -556,7 +587,7 @@ def l1_rgb_with_mask(ddope):
     """
 
     diff_rgb = torch.abs(
-        (ddope.renders["rgb"] - ddope.gt_tensors["rgb"])
+        (ddope.renders["rgb"][...,:3] - ddope.gt_tensors["rgb"][...,:3])
         * ddope.gt_tensors["segmentation"]
     )
     lr_diff_rgb = dist_batch_lr(diff_rgb, ddope.learning_rates)
@@ -598,7 +629,7 @@ def l1_mask(ddope):
     """
 
     mask = ddope.renders["mask"]
-    ddope.optimization_results[-1]["mask"] = mask.detach().cpu()
+    ddope.optimization_results[-1]["mask"] = mask.detach()#.cpu()
 
     # Compute the difference between the mask and ground truth segmentation
     diff_mask = torch.abs(mask - ddope.gt_tensors["segmentation"])
@@ -1010,7 +1041,9 @@ class Object3D(torch.nn.Module):
             rotation = pyrr.Matrix33(rotation).quaternion
 
         if opencv2opengl:
+            print(position, rotation)
             position, rotation = opencv_2_opengl(position, rotation)
+            print(position, rotation)
 
         log.info(f"translation loaded: {position}")
         log.info(f"rotation loaded as quaternion: {rotation}")
@@ -1043,11 +1076,42 @@ class Object3D(torch.nn.Module):
             batchsize (int): Batchsize to optimize
         """
         device = self.qx.device
+        # r6 = r6_from_quat(self._rotation)
 
-        self.qx = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[0])
-        self.qy = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[1])
-        self.qz = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[2])
-        self.qw = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[3])
+        quat = th.as_tensor(np.stack([
+                self._rotation[0],
+                self._rotation[1],
+                self._rotation[2],
+                self._rotation[3]], axis=-1),
+                                        dtype=th.float32)
+        if RTYPE == 'r6':
+            r6 = r6_from_quat(quat)
+            br6 = einops.repeat(r6, '... -> b ...', b = batchsize)
+            self.register_parameter('r6',
+                                    th.nn.Parameter(br6.clone(), requires_grad=True))
+            with th.no_grad():
+                #self.r6 += 0.1 * th.randn_like(self.r6)
+                self.r6 /= SCALE
+        elif RTYPE == 'quat':
+            self.qx = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[0])
+            self.qy = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[1])
+            self.qz = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[2])
+            self.qw = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[3])
+        elif RTYPE == 'd_axa':
+            self.register_buffer('q0', quat, False)
+            self.d_axa = self.register_parmeter(
+                    'd_axa',
+                    nn.Parameter(torch.zeros((batchsize,3),
+                                             dtype=th.float32)))
+
+        # self.r0 = torch.nn.Parameter(torch.ones(batchsize) * r6[0])
+        # self.r1 = torch.nn.Parameter(torch.ones(batchsize) * r6[1])
+        # self.r2 = torch.nn.Parameter(torch.ones(batchsize) * r6[2])
+        # self.r3 = torch.nn.Parameter(torch.ones(batchsize) * r6[3])
+        # self.r4 = torch.nn.Parameter(torch.ones(batchsize) * r6[4])
+        # self.r5 = torch.nn.Parameter(torch.ones(batchsize) * r6[5])
+        # self.r6
+
 
         self.x = torch.nn.Parameter(torch.ones(batchsize) * self._position[0])
         self.y = torch.nn.Parameter(torch.ones(batchsize) * self._position[1])
@@ -1077,10 +1141,25 @@ class Object3D(torch.nn.Module):
         """
         device = self.qx.device
 
-        self.qx = torch.nn.Parameter(torch.ones(self.qx.shape[0]) * self._rotation[0])
-        self.qy = torch.nn.Parameter(torch.ones(self.qx.shape[0]) * self._rotation[1])
-        self.qz = torch.nn.Parameter(torch.ones(self.qx.shape[0]) * self._rotation[2])
-        self.qw = torch.nn.Parameter(torch.ones(self.qx.shape[0]) * self._rotation[3])
+        # self.qx = torch.nn.Parameter(torch.ones(self.qx.shape[0]) * self._rotation[0])
+        # self.qy = torch.nn.Parameter(torch.ones(self.qx.shape[0]) * self._rotation[1])
+        # self.qz = torch.nn.Parameter(torch.ones(self.qx.shape[0]) * self._rotation[2])
+        # self.qw = torch.nn.Parameter(torch.ones(self.qx.shape[0]) * self._rotation[3])
+        batch_size:int = self.qx.shape[0]
+        r6 = r6_from_quat(th.as_tensor(np.stack([
+            self._rotation[0],
+            self._rotation[1],
+            self._rotation[2],
+            self._rotation[3]], axis=-1)))
+        # self.r0 = torch.nn.Parameter(torch.ones(batch_size) * r6[0])
+        # self.r1 = torch.nn.Parameter(torch.ones(batch_size) * r6[1])
+        # self.r2 = torch.nn.Parameter(torch.ones(batch_size) * r6[2])
+        # self.r3 = torch.nn.Parameter(torch.ones(batch_size) * r6[3])
+        # self.r4 = torch.nn.Parameter(torch.ones(batch_size) * r6[4])
+        # self.r5 = torch.nn.Parameter(torch.ones(batch_size) * r6[5])
+        br6 = einops.repeat(r6, '... -> b ...', b = batch_size)
+        self.register_parameter('r6',
+                                th.nn.Parameter(br6.clone(), requires_grad=True))
 
         self.x = torch.nn.Parameter(torch.ones(self.qx.shape[0]) * self._position[0])
         self.y = torch.nn.Parameter(torch.ones(self.qx.shape[0]) * self._position[1])
@@ -1093,12 +1172,19 @@ class Object3D(torch.nn.Module):
         Return:
             returns a dict with field quat, trans.
         """
-        q = torch.stack([self.qx, self.qy, self.qz, self.qw], dim=0).T
-        q = q / torch.norm(q, dim=1).reshape(-1, 1)
+        # q = torch.stack([self.qx, self.qy, self.qz, self.qw], dim=0).T
+        # q = q / torch.norm(q, dim=1).reshape(-1, 1)
 
         # TODO add the dict from object3d to the output of the module.
         to_return = self.mesh()
-        to_return["quat"] = q
+        #to_return["quat"] = q
+        to_return["rot6"] = self.r6
+        # torch.stack([self.r0,
+        #                                  self.r1,
+        #                                  self.r2,
+        #                                  self.r3,
+        #                                  self.r4,
+        #                                  self.r5], dim=-1)
         to_return["trans"] = torch.stack([self.x, self.y, self.z], dim=0).T
 
         return to_return
@@ -1367,7 +1453,8 @@ class DiffDope:
         # self.object3d.mesh.enable_gradients_texture()
 
         self.optimizer = torch.optim.SGD(
-            self.object3d.parameters(), lr=self.cfg.hyperparameters.learning_rate_base
+            self.object3d.parameters(),
+            lr=self.cfg.hyperparameters.learning_rate_base
         )
 
         # TODO add a seed to the random
@@ -1568,12 +1655,12 @@ class DiffDope:
 
         if key not in self.losses_values:
             self.losses_values[key] = (
-                values.detach().cpu().unsqueeze(0)
+                values.detach().unsqueeze(0)
             )  # Create an empty tensor of the same data type
         else:
             # Append the new values (assuming values is a 1D tensor)
             self.losses_values[key] = torch.cat(
-                (self.losses_values[key], values.detach().cpu().unsqueeze(0)), dim=0
+                (self.losses_values[key], values.detach().unsqueeze(0)), dim=0
             )
 
     def plot_losses(self, keys=None, batch_index=-1):
@@ -1601,7 +1688,7 @@ class DiffDope:
         # Plot the batch_index values as lines
         for i, key in enumerate(self.losses_values.keys()):
             plt.plot(
-                self.losses_values[key][..., batch_index].numpy(), marker="o", label=key
+                dcn(self.losses_values[key][..., batch_index]), marker="o", label=key
             )
         # plt.show()
         plt.legend()
@@ -1633,7 +1720,7 @@ class DiffDope:
         if batch_index == -1:
             batch_index = self.get_argmin()
 
-        matrix44 = self.optimization_results[-1]["mtx"][batch_index].numpy()
+        matrix44 = dcn(self.optimization_results[-1]["mtx"][batch_index])
 
         return matrix44
 
@@ -1646,7 +1733,8 @@ class DiffDope:
         self.optimization_results = []
 
         self.optimizer = torch.optim.SGD(
-            self.object3d.parameters(), lr=self.cfg.hyperparameters.learning_rate_base
+            self.object3d.parameters(),
+            lr=self.cfg.hyperparameters.learning_rate_base
         )
 
         if self.scene.tensor_rgb is not None:
@@ -1658,6 +1746,11 @@ class DiffDope:
 
 
         pbar = tqdm(range(self.cfg.hyperparameters.nb_iterations + 1))
+
+        T0 = th.zeros((self.batchsize, 4, 4),
+                          dtype=th.float32,
+                          device=self.object3d.x.device)
+        T0[..., 3, 3] = 1
 
         for iteration_now in pbar:
             itf = iteration_now / self.cfg.hyperparameters.nb_iterations + 1
@@ -1674,9 +1767,23 @@ class DiffDope:
             result = self.object3d()
 
             # transform quat and position into a matrix44
-            mtx_gu = matrix_batch_44_from_position_quat(
-                p=result["trans"], q=result["quat"]
-            )
+            # if 'quat' in result:
+            #     mtx_gu = matrix_batch_44_from_position_quat(
+            #         p=result["trans"], q=result["quat"]
+            #     )
+            # elif 'rot6' in result:
+            #     mtx_gu = matrix_batch_44_from_position_quat(
+            #         p=result["trans"],
+            #         r6=result["rot6"]
+            #     )
+            mtx_gu = th.cat([th.cat(
+                    [matrix_from_r6(result['rot6'] * SCALE),
+                     result['trans'][..., :, None]], dim=-1),
+                             T0[..., 3:, :]], dim=-2)
+
+            # mtx_gu = T0.slice_scatter(
+            #         matrix_from_r6(result['rot6'] * SCALE),
+            #         dim=-2, start=0, end=3)
 
             if self.object3d.mesh.has_textured_map is False:
                 self.renders = render_texture_batch(
@@ -1702,20 +1809,20 @@ class DiffDope:
                     resolution=self.resolution,
                 )
             to_add = {}
-            to_add["rgb"] = self.renders["rgb"].detach().cpu()
-            to_add["depth"] = self.renders["depth"].detach().cpu()
-            to_add["mtx"] = mtx_gu.detach().cpu()
+            to_add["rgb"] = self.renders["rgb"].detach()#.cpu()
+            to_add["depth"] = self.renders["depth"].detach()#.cpu()
+            to_add["mtx"] = mtx_gu.detach()#.cpu()
 
             self.optimization_results.append(to_add)
 
             # computing the losses
-            loss = torch.zeros(1).cuda()
+            loss = torch.zeros((), device='cuda')#.cuda()
             for loss_function in self.loss_functions:
                 l = loss_function(self)
                 if l is None:
                     continue
                 loss += l
-            pbar.set_description(f"loss: {loss.item():.4f}")
+            #pbar.set_description(f"loss: {loss.item():.4f}")
             loss.backward()
             self.optimizer.step()
 
