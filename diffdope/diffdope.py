@@ -1759,7 +1759,6 @@ class DiffDope:
                 self.cfg.hyperparameters.base_lr
                 * self.cfg.hyperparameters.lr_decay**itf
             )
-            print(lr)
 
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lr
