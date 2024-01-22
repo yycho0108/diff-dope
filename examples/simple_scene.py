@@ -3,6 +3,7 @@ import os
 import cv2
 import hydra
 from icecream import ic
+import time
 from omegaconf import DictConfig, OmegaConf
 
 import diffdope as dd
@@ -14,9 +15,11 @@ def main(cfg: DictConfig):
     ddope = dd.DiffDope(cfg=cfg)
 
     # run the optimization
+    t0=(time.time())
     ddope.run_optimization()
-
     ic(ddope.get_argmin(), ddope.get_pose())
+    t1=(time.time())
+    print('dt', t1-t0)
 
     # get the loss plot for the argmin of the optimization
     img_plot = ddope.plot_losses()

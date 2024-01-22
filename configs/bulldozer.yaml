@@ -18,6 +18,7 @@ object3d:
     rotation: [ 0.6427876 ,  0.26198718,  0.71931569,  0.        , -0.939     ,
         0.342     ,  0.7660444 , -0.21983336, -0.60357756]
     model_path: /tmp/docker/bulldozer_normalized/bulldozer_normalized.obj
+    # model_path: /tmp/docker/merge/filled/simplified/simplified.obj
 losses:
     l1_rgb_with_mask: true
     weight_rgb: 0.7
@@ -26,10 +27,10 @@ losses:
     l1_mask: false
     weight_mask: 1.0
 hyperparameters:
-    nb_iterations: 16
+    nb_iterations: 64
     batchsize: 64
     base_lr: 20
-    learning_rates_bound: [1.0, 4.0]
+    learning_rates_bound: [1.0, 2.0]
     learning_rate_base: 1
     lr_decay: 0.1
 render_images:
