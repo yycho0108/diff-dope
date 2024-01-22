@@ -243,35 +243,35 @@ def render_texture_batch(
     )
 
     # compute the depth
-    gb_pos, _ = interpolate(posw, rast_out, pos_idx[0], rast_db=rast_out_db)
-    shape_keep = gb_pos.shape
-    gb_pos = gb_pos.reshape(shape_keep[0], -1, shape_keep[-1])
-    # print('gb3', gb_pos[..., 3]) # 0
-    # gb_pos = gb_pos[..., :3]
-    gb_pos[..., 3].fill_(1)
-    # print(gb_pos.shape)
+    depth = None
+    if False:
+        gb_pos, _ = interpolate(posw, rast_out, pos_idx[0], rast_db=rast_out_db)
+        shape_keep = gb_pos.shape
+        gb_pos = gb_pos.reshape(shape_keep[0], -1, shape_keep[-1])
+        gb_pos[..., 3].fill_(1)
+        # print(gb_pos.shape)
 
-    # if True:
-    #     depth0 = dd.xfm_points(gb_pos[..., :3].contiguous(), mtx)
-    #     depth0 = depth0.reshape(shape_keep)[..., 2] * -1
+        # if True:
+        #     depth0 = dd.xfm_points(gb_pos[..., :3].contiguous(), mtx)
+        #     depth0 = depth0.reshape(shape_keep)[..., 2] * -1
 
-    # if True:
-    #     depth = th.matmul(gb_pos, th.transpose(mtx, 1, 2))
-    #     depth = depth.reshape(shape_keep)[..., 2] * -1
-    #     depth1 = depth
+        # if True:
+        #     depth = th.matmul(gb_pos, th.transpose(mtx, 1, 2))
+        #     depth = depth.reshape(shape_keep)[..., 2] * -1
+        #     depth1 = depth
 
-    # depth = mtx @ gb_pos
-    # == basically mtx[:3,:3] @ gb_pos + mtx[:3, 3]
-    # depth = gb_pos[..., 
-    # print(gb_pos.shape)
-    # print(mtx[..., 2, :3].shape)
-    #depth = mtx[..., 2, :3].dot(gb_pos[..., :3]) + mtx[2,3]
-    # depth = th.einsum('ni, npi -> np', mtx[..., 2], gb_pos) + mtx[..., 2,3]
-    depth = th.matmul(gb_pos, mtx[..., 2, :, None]).squeeze(dim=-1)
-    depth = -depth.reshape(shape_keep[:-1])
-    # print((depth - depth1).std())
-    # print((depth - depth0).std())
-    # print(depth.shape)
+        # depth = mtx @ gb_pos
+        # == basically mtx[:3,:3] @ gb_pos + mtx[:3, 3]
+        # depth = gb_pos[..., 
+        # print(gb_pos.shape)
+        # print(mtx[..., 2, :3].shape)
+        #depth = mtx[..., 2, :3].dot(gb_pos[..., :3]) + mtx[2,3]
+        # depth = th.einsum('ni, npi -> np', mtx[..., 2], gb_pos) + mtx[..., 2,3]
+        depth = th.matmul(gb_pos, mtx[..., 2, :, None]).squeeze(dim=-1)
+        depth = -depth.reshape(shape_keep[:-1])
+        # print((depth - depth1).std())
+        # print((depth - depth0).std())
+        # print(depth.shape)
 
     # mask   , _ = dr.interpolate(torch.ones(pos_idx.shape).cuda(), rast_out, pos_idx)
     mask = None
@@ -1840,7 +1840,10 @@ class DiffDope:
                         )
                     to_add = {}
                     to_add["rgb"] = self.renders["rgb"].detach()#.cpu()
-                    to_add["depth"] = self.renders["depth"].detach()#.cpu()
+                    if self.renders['depth'] is not None:
+                        to_add["depth"] = self.renders["depth"].detach()#.cpu()
+                    else:
+                        to_add["depth"] = None
                     to_add["mtx"] = mtx_gu.detach()#.cpu()
 
                     self.optimization_results.append(to_add)
