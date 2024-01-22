@@ -1602,6 +1602,7 @@ class DiffDope:
 
         # Find the argmin of the average tensor
         argmin = torch.argmin(average_tensor, dim=-1)
+        print('lr', self.learning_rates[argmin])
 
         return argmin
 
@@ -1758,6 +1759,7 @@ class DiffDope:
                 self.cfg.hyperparameters.base_lr
                 * self.cfg.hyperparameters.lr_decay**itf
             )
+            print(lr)
 
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lr

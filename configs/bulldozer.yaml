@@ -26,10 +26,10 @@ losses:
     l1_mask: false
     weight_mask: 1.0
 hyperparameters:
-    nb_iterations: 256
-    batchsize: 128
+    nb_iterations: 16
+    batchsize: 64
     base_lr: 20
-    learning_rates_bound: [0.01, 100]
+    learning_rates_bound: [1.0, 4.0]
     learning_rate_base: 1
     lr_decay: 0.1
 render_images:
