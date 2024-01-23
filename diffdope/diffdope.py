@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from itertools import repeat
 from types import FunctionType
 from typing import Any, BinaryIO, List, Optional, Tuple, Union
+from typing import Dict
 
 import cv2
 import hydra
@@ -41,10 +42,14 @@ import opt_einsum as oe
 import diffdope as dd
 from pkm.util.torch_util import dcn
 from pkm.util.math_util import (
-        r6_from_quat,
-        matrix_from_r6,
-        )
+    r6_from_quat,
+    matrix_from_r6,
+    axa_from_quat,
+    matrix_from_quaternion
+)
 from torchviz import (make_dot, make_dot_from_trace)
+
+from diffdope.lie_utils import SE3Exp, SE3
 
 # for better print debug
 print()
@@ -55,10 +60,13 @@ if not hasattr(sys, 'ps1'):
 log = logging.getLogger(__name__)
 
 # adjust rotation parameterization
-RTYPE = 'r6'
+RTYPE = 'se3'
 # adjust rotation parameter 'sensitivity'
 # higher scale = more sensitive (i.e. more likely to change)
 SCALE = 10.0
+S_TEX = 0.5
+LOCAL: bool = True
+
 
 def matrix_batch_44_from_position_quat(p, q=None, r6=None):
     """
@@ -135,8 +143,8 @@ def opencv_2_opengl(p, q):
     # Adjust rotation and translation for target coordinate system
     adjusted_rotation = np.dot(R_opengl_to_opencv, source_transform[:3, :3])
     adjusted_translation = (
-            np.dot(R_opengl_to_opencv, source_transform[3, :3]) + t_opengl_to_opencv
-    )
+        np.dot(R_opengl_to_opencv, source_transform[3, : 3]) +
+        t_opengl_to_opencv)
     # print(p)
     # print(source_transform[:3, 3])
     # print(np.dot(R_opengl_to_opencv, source_transform[:3, 3]))
@@ -182,11 +190,12 @@ def interpolate(attr, rast, attr_idx, rast_db=None):
 
 
 # @th.jit.script
+# @torch.compile
 def render_texture_batch(
     glctx,
     proj_cam,
     mtx,
-    pos,
+    posw,
     pos_idx,
     resolution,
     uv=None,
@@ -222,7 +231,7 @@ def render_texture_batch(
     # print('pos', pos.shape)
     # posw = torch.cat([pos, torch.ones([pos.shape[0], pos.shape[1], 1]).cuda()], axis=2)
     # print('posw', posw.shape)
-    posw = nn.functional.pad(pos, (0, 1), mode='constant', value=1)
+    # posw = nn.functional.pad(pos, (0, 1), mode='constant', value=1)
     # print(posw[..., 3]) # should be one
     # mtx_transpose = torch.transpose(mtx, 1, 2)
     # final_mtx_proj = th.matmul(proj_cam, mtx)
@@ -234,9 +243,14 @@ def render_texture_batch(
     # print(posw.shape,
     #       proj_cam.shape,
     #       mtx.shape)
-    # pos_clip_ja = th.einsum('nij, njk, n...k -> n...i',
-    #                         proj_cam, mtx, posw)
-    pos_clip_ja = oe_expr(proj_cam, mtx, posw)
+
+    # Potentially better to keep it
+    # as einsum() to exploit torch.compile()
+    pos_clip_ja = th.einsum('nij, njk, n...k -> n...i',
+                            proj_cam, mtx, posw)
+    # pos_clip_ja = oe_expr(proj_cam, mtx, posw)
+    # pos_clip_ja = oe_expr(mtx).contiguous()
+
     # print(pos_clip_ja.shape)
 
     rast_out, rast_out_db = dr.rasterize(
@@ -246,7 +260,9 @@ def render_texture_batch(
     # compute the depth
     depth = None
     if False:
-        gb_pos, _ = interpolate(posw, rast_out, pos_idx[0], rast_db=rast_out_db)
+        gb_pos, _ = interpolate(
+            posw, rast_out, pos_idx[0],
+            rast_db=rast_out_db)
         shape_keep = gb_pos.shape
         gb_pos = gb_pos.reshape(shape_keep[0], -1, shape_keep[-1])
         gb_pos[..., 3].fill_(1)
@@ -263,10 +279,10 @@ def render_texture_batch(
 
         # depth = mtx @ gb_pos
         # == basically mtx[:3,:3] @ gb_pos + mtx[:3, 3]
-        # depth = gb_pos[..., 
+        # depth = gb_pos[...,
         # print(gb_pos.shape)
         # print(mtx[..., 2, :3].shape)
-        #depth = mtx[..., 2, :3].dot(gb_pos[..., :3]) + mtx[2,3]
+        # depth = mtx[..., 2, :3].dot(gb_pos[..., :3]) + mtx[2,3]
         # depth = th.einsum('ni, npi -> np', mtx[..., 2], gb_pos) + mtx[..., 2,3]
         depth = th.matmul(gb_pos, mtx[..., 2, :, None]).squeeze(dim=-1)
         depth = -depth.reshape(shape_keep[:-1])
@@ -278,10 +294,10 @@ def render_texture_batch(
     mask = None
     if False:
         mask, _ = dr.interpolate(
-                # torch.ones(pos_idx.shape).cuda(), 
-                th.ones(pos_idx.shape, device='cuda'),
-            rast_out, pos_idx[0],rast_db=rast_out_db, diff_attrs="all")
-        mask       = dr.antialias(mask, rast_out, pos_clip_ja, pos_idx[0])
+            # torch.ones(pos_idx.shape).cuda(),
+            th.ones(pos_idx.shape, device='cuda'),
+            rast_out, pos_idx[0], rast_db=rast_out_db, diff_attrs="all")
+        mask = dr.antialias(mask, rast_out, pos_clip_ja, pos_idx[0])
 
     # compute vertex color interpolation
     if vtx_color is None:
@@ -294,20 +310,56 @@ def render_texture_batch(
             texd,
             filter_mode="linear",
         )
-        # color = dr.texture(
-        #     tex,
-        #     texc,
-        #     texd,
-        #     filter_mode="linear",
-        # )
-        color = color * (rast_out[..., -1:] > 0)  # Mask out background.
+        # color = color * (rast_out[..., -1:] > 0)  # Mask out background.
     else:
         color, _ = dr.interpolate(vtx_color, rast_out, pos_idx[0])
-        color = color * (rast_out[..., -1:] > 0)  # Mask out background.
-    if not return_rast_out:
-        rast_out = None
-    return {"rgb": color, "depth": depth, "rast_out": rast_out, 'mask':mask}
+        # color = color * (rast_out[..., -1:] > 0)  # Mask out background.
+    # if not return_rast_out:
+    #     rast_out = None
+    return {"rgb": color, "depth": depth, "rast_out": rast_out, 'mask': mask}
 
+@torch.compile()
+def loss_fn(
+        gt_tensors:Dict[str, th.Tensor],
+        proj_cam:th.Tensor,
+        #mtx_gu:th.Tensor,
+
+        T0:th.Tensor,
+        u_se3:th.Tensor,
+        scale:th.Tensor,
+        g:th.Tensor,
+
+        posw:th.Tensor,
+        pos_idx:th.Tensor,
+        uv:th.Tensor,
+        uv_idx:th.Tensor,
+        tex:th.Tensor,
+        learning_rates:th.Tensor,
+        weight_rgb:float,
+        resolution:Tuple[int,int],
+        # oe_expr,
+        glctx
+    ):
+    mtx_gu = T0 @ SE3Exp(u_se3 * scale, g)
+    # mtx_gu = SE3Exp(u_se3 * scale, g) @ T0
+    renders = render_texture_batch(
+                            glctx=glctx,
+                            proj_cam=proj_cam,
+                            mtx=mtx_gu,
+                            posw=posw,
+                            pos_idx=pos_idx,
+                            uv=uv,
+                            uv_idx=uv_idx,
+                            tex=tex,
+                            resolution=resolution)
+    return l1_rgb_with_mask_t(
+                # ddope.renders['rgb'][..., :3],
+                renders['rgb'],
+                gt_tensors['rgb'][..., :3],
+                renders['rast_out'][..., -1:],
+                gt_tensors["segmentation"],
+                learning_rates,
+                weight_rgb), mtx_gu, renders['rgb']
 
 ##############################################################################
 # IMG MANIPULATION
@@ -333,7 +385,8 @@ def find_crop(img_tensor, percentage=0.1):
     top_row, left_col = rows.min(), cols.min()
     bottom_row, right_col = rows.max(), cols.max()
 
-    # Calculate the wiggle room for each dimension (percentage of the width/height)
+    # Calculate the wiggle room for each dimension (percentage of the
+    # width/height)
     wiggle_room_rows = int((bottom_row - top_row + 1) * percentage)
     wiggle_room_cols = int((right_col - left_col + 1) * percentage)
 
@@ -343,45 +396,46 @@ def find_crop(img_tensor, percentage=0.1):
     bottom_row = min(img_tensor.shape[0] - 1, bottom_row + wiggle_room_rows)
     right_col = min(img_tensor.shape[1] - 1, right_col + wiggle_room_cols)
 
-    # Calculate the size of the square crop as the minimum of the expanded height and width
+    # Calculate the size of the square crop as the minimum of the expanded
+    # height and width
     crop_size = max(bottom_row - top_row, right_col - left_col)
 
     return [top_row, left_col, crop_size]
 
 
-def getimg_stack(color_imgs, depth=False, depth_max=3, w=1, h=1):
-    if depth:
-        for i_im in range(len(color_imgs)):
-            color_imgs[i_im] = torch.cat(
-                [
-                    color_imgs[i_im].unsqueeze(-1),
-                    color_imgs[i_im].unsqueeze(-1),
-                    color_imgs[i_im].unsqueeze(-1),
-                ],
-                dim=-1,
-            )
+# def getimg_stack(color_imgs, depth=False, depth_max=3, w=1, h=1):
+#     if depth:
+#         for i_im in range(len(color_imgs)):
+#             color_imgs[i_im] = torch.cat(
+#                 [
+#                     color_imgs[i_im].unsqueeze(-1),
+#                     color_imgs[i_im].unsqueeze(-1),
+#                     color_imgs[i_im].unsqueeze(-1),
+#                 ],
+#                 dim=-1,
+#             )
 
-            color_imgs[i_im][color_imgs[i_im] < 0] = depth_max
+#             color_imgs[i_im][color_imgs[i_im] < 0] = depth_max
 
-            color_imgs[i_im] /= depth_max
-            # print(color_imgs[i_im].shape)
+#             color_imgs[i_im] /= depth_max
+#             # print(color_imgs[i_im].shape)
 
-    col_imgs = []
-    for ii in range(h):
-        row_imgs = []
-        for jj in range(w):
-            if ii + jj < len(color_imgs):
-                img_ref = color_imgs[ii + jj][0].detach().cpu().numpy()
-            else:
-                img_ref = np.zeros(color_imgs[-1][0].shape)
-            row_imgs.append(img_ref)
+#     col_imgs = []
+#     for ei in range(h):
+#         row_imgs = []
+#         for jj in range(w):
+#             if ii + jj < len(color_imgs):
+#                 img_ref = color_imgs[ii + jj][0].detach().cpu().numpy()
+#             else:
+#                 img_ref = np.zeros(color_imgs[-1][0].shape)
+#             row_imgs.append(img_ref)
 
-        row_all = np.concatenate(row_imgs, axis=1)[::-1]
-        # print(row_all.shape)
-        col_imgs.append(row_all)
-    gt_final = np.concatenate(col_imgs, axis=0)
-    # return cv2.resize(gt_final,(400,400))
-    return gt_final
+#         row_all = np.concatenate(row_imgs, axis=1)[::-1]
+#         # print(row_all.shape)
+#         col_imgs.append(row_all)
+#     gt_final = np.concatenate(col_imgs, axis=0)
+#     # return cv2.resize(gt_final,(400,400))
+#     return gt_final
 
 
 @torch.no_grad()
@@ -448,7 +502,8 @@ def make_grid(
                         f"tensor or list of tensors expected, got a list containing {type(t)}"
                     )
         else:
-            raise TypeError(f"tensor or list of tensors expected, got {type(tensor)}")
+            raise TypeError(
+                f"tensor or list of tensors expected, got {type(tensor)}")
 
     # if list of tensors, convert to a 4D mini-batch Tensor
     if isinstance(tensor, list):
@@ -496,11 +551,14 @@ def make_grid(
     nmaps = tensor.size(0)
     xmaps = min(nrow, nmaps)
     ymaps = int(math.ceil(float(nmaps) / xmaps))
-    height, width = int(tensor.size(2) + padding), int(tensor.size(3) + padding)
+    height, width = int(tensor.size(
+        2) + padding), int(tensor.size(3) + padding)
     num_channels = tensor.size(1)
     grid = tensor.new_full(
-        (num_channels, height * ymaps + padding, width * xmaps + padding), pad_value
-    )
+        (num_channels,
+         height * ymaps + padding,
+         width * xmaps + padding),
+        pad_value)
     k = 0
     for y in range(ymaps):
         for x in range(xmaps):
@@ -529,7 +587,9 @@ def make_grid_image(img_batch, row, final_width, depth=False):
     )
     img_batch = cv2.cvtColor(img_batch, cv2.COLOR_BGR2RGB)
     if depth is True:
-        img_batch = cv2.applyColorMap((img_batch).astype(np.uint8), cv2.COLORMAP_JET)
+        img_batch = cv2.applyColorMap(
+            (img_batch).astype(np.uint8),
+            cv2.COLORMAP_JET)
     img_batch = im_resize(img_batch, width=final_width)
 
     return img_batch
@@ -575,7 +635,10 @@ def make_grid_overlay_batch(
         gray = gray.astype(np.uint8)
         alpha_img[gray > 0] = alpha
 
-        cnts = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = cv2.findContours(
+            gray,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE)
         cnts = cnts[0] if len(cnts) == 2 else cnts[1]
 
     if not background is None and add_background:
@@ -585,18 +648,17 @@ def make_grid_overlay_batch(
         background = np.zeros(foreground.shape)
 
     blended_image = cv2.merge(
-        (
-            alpha_img * foreground[:, :, 0] + (1 - alpha_img) * background[:, :, 0],
-            alpha_img * foreground[:, :, 1] + (1 - alpha_img) * background[:, :, 1],
-            alpha_img * foreground[:, :, 2] + (1 - alpha_img) * background[:, :, 2],
-        )
-    ).astype("uint8")
+        (alpha_img * foreground[:, :, 0] + (1 - alpha_img) *
+         background[:, :, 0],
+         alpha_img * foreground[:, :, 1] + (1 - alpha_img) *
+         background[:, :, 1],
+         alpha_img * foreground[:, :, 2] + (1 - alpha_img) *
+         background[:, :, 2],)).astype("uint8")
 
     if add_contour:
         for c in cnts:
             cv2.drawContours(
-                blended_image, [c], -1, (36, 255, 12), thickness=1, lineType=cv2.LINE_AA
-            )
+                blended_image, [c], -1, (36, 255, 12), thickness=1, lineType=cv2.LINE_AA)
     if flip_result:
         blended_image = cv2.flip(blended_image, 0)
 
@@ -606,7 +668,10 @@ def make_grid_overlay_batch(
 ##############################################################################
 # LOSSES
 ##############################################################################
-def dist_batch_lr(tensor, learning_rates, channels=[1, 2, 3]):
+def dist_batch_lr(x:th.Tensor,
+                  learning_rates:th.Tensor,
+                  # channels:Tuple[int,int,int]=( 1, 2, 3 )
+                  ) -> th.Tensor:
     """
     Method that distribute different learning rates to the batch.
 
@@ -615,25 +680,47 @@ def dist_batch_lr(tensor, learning_rates, channels=[1, 2, 3]):
         learning_rates (torch.tensor): B the different learning rates needed.
         channels (list): the index values used to apply the first mean, e.g., [1,2,3] for colored image, or [1,2] for a depth map
     """
+    # return torch.mean(tensor, channels) * learning_rates
+    return x.reshape(x.shape[0], -1).mean(dim=-1) * learning_rates
 
-    return torch.mean(tensor, channels) * learning_rates
+# @th.jit.script
+# @torch.compile
+def l1_rgb_with_mask_t(pred_rgb:th.Tensor,
+                       true_rgb:th.Tensor,
+                       pred_mask: th.Tensor,
+                       true_mask:th.Tensor,
+                       learning_rates:th.Tensor,
+                       weight_rgb:float) -> th.Tensor:
+    diff_rgb = torch.abs((pred_rgb * (pred_mask>0) - true_rgb) * (true_mask))
+    # lr_diff_rgb = dist_batch_lr(diff_rgb, learning_rates)
+    batch_err = diff_rgb.reshape(diff_rgb.shape[0], -1).mean(dim=-1)
+    lr_diff_rgb = batch_err * learning_rates
+    return lr_diff_rgb.mean() * weight_rgb, batch_err
 
 
-def l1_rgb_with_mask(ddope):
+def l1_rgb_with_mask(ddope, log:bool = False):
     """
     Computes the l1_rgb on a DiffDOPE object, simpler to pass the object.
     """
-
+    if not log:
+        return l1_rgb_with_mask_t(
+                # ddope.renders['rgb'][..., :3],
+                ddope.renders['rgb'],
+                ddope.gt_tensors['rgb'][..., :3],
+                ddope.renders['rast_out'][..., -1:],
+                ddope.gt_tensors["segmentation"],
+                ddope.learning_rates,
+                ddope.cfg.losses.weight_rgb)
     diff_rgb = torch.abs(
-        (ddope.renders["rgb"][...,:3] - ddope.gt_tensors["rgb"][...,:3])
-        * ddope.gt_tensors["segmentation"]
+        (ddope.renders["rgb"][..., :3] - ddope.gt_tensors["rgb"][..., :3])
+        * (ddope.gt_tensors["segmentation"]
+           # * (ddope.renders["rast_out"][..., -1:] > 0 )
+           )
     )
     lr_diff_rgb = dist_batch_lr(diff_rgb, ddope.learning_rates)
-
     ddope.add_loss_value(
-        "rgb", torch.mean(diff_rgb.detach(), (1, 2, 3)) * ddope.cfg.losses.weight_rgb
-    )
-
+        "rgb", torch.mean(
+            diff_rgb.detach(), (1, 2, 3)) * ddope.cfg.losses.weight_rgb)
     return lr_diff_rgb.mean() * ddope.cfg.losses.weight_rgb
 
 
@@ -649,8 +736,8 @@ def l1_depth_with_mask(ddope):
     lr_diff_depth = dist_batch_lr(diff_depth, ddope.learning_rates, [1, 2])
 
     ddope.add_loss_value(
-        "depth", torch.mean(diff_depth.detach(), (1, 2)) * ddope.cfg.losses.weight_depth
-    )
+        "depth", torch.mean(
+            diff_depth.detach(), (1, 2)) * ddope.cfg.losses.weight_depth)
 
     return lr_diff_depth.mean() * ddope.cfg.losses.weight_depth
 
@@ -667,7 +754,7 @@ def l1_mask(ddope):
     """
 
     mask = ddope.renders["mask"]
-    ddope.optimization_results[-1]["mask"] = mask.detach()#.cpu()
+    ddope.optimization_results[-1]["mask"] = mask.detach()  # .cpu()
 
     # Compute the difference between the mask and ground truth segmentation
     diff_mask = torch.abs(mask - ddope.gt_tensors["segmentation"])
@@ -682,7 +769,8 @@ def l1_mask(ddope):
         * ddope.cfg.losses.weight_mask,
     )
 
-    # Calculate the mean of the L1-on mask loss and apply the weight from the configuration
+    # Calculate the mean of the L1-on mask loss and apply the weight from the
+    # configuration
     lr_diff_mask_mean = lr_diff_mask.mean() * ddope.cfg.losses.weight_mask
 
     return lr_diff_mask_mean
@@ -797,7 +885,8 @@ class Camera:
             )
 
         # Draw the images upright and modify the projection matrix so that OpenGL
-        # will generate window coords that compensate for the flipped image coords.
+        # will generate window coords that compensate for the flipped image
+        # coords.
         else:
             assert window_coords == "y_down"
             proj = np.array(
@@ -847,7 +936,8 @@ class Mesh(torch.nn.Module):
         # load the mesh
         self.path_model = path_model
         self.to_process = [
-            "pos",
+            # "pos",
+            "posw",
             "pos_idx",
             "vtx_color",
             "tex",
@@ -897,12 +987,20 @@ class Mesh(torch.nn.Module):
             uv[:, 1] = 1 - uv[:, 1]
             uv_idx = np.asarray(mesh.faces)
 
-            tex = torch.from_numpy(tex.astype(np.float32))
+            if True:
+                #print(uv.m
+                tex = cv2.resize(tex, dsize=None, fx=S_TEX, fy=S_TEX)
+                #uv *= S_TEX
+
+            tex = torch.from_numpy(tex.astype(np.float32))[..., :3]
+            # tex = torch.from_numpy(tex.astype(np.float32))
             uv_idx = torch.from_numpy(uv_idx.astype(np.int32))
             vtx_uv = torch.from_numpy(uv.astype(np.float32))
 
             self.pos_idx = pos_idx
-            self.pos = vtx_pos
+            # self.pos = vtx_pos
+            self.posw = nn.functional.pad(vtx_pos,
+                                         (0, 1), mode='constant', value=1)
             self.tex = tex
             self.uv = vtx_uv
             self.uv_idx = uv_idx
@@ -917,7 +1015,9 @@ class Mesh(torch.nn.Module):
             vertex_color = torch.from_numpy(vertex_color.astype(np.float32))
 
             self.pos_idx = pos_idx
-            self.pos = vtx_pos
+            # self.pos = vtx_pos
+            self.posw = nn.functional.pad(vtx_pos,
+                                         (0, 1), mode='constant', value=1)
             self.vtx_color = vertex_color
             self.bounding_volume = bounding_volume
             self.dimensions = dimensions
@@ -930,11 +1030,16 @@ class Mesh(torch.nn.Module):
         )
         self._batchsize_set = False
 
+    @property
+    def device(self):
+        return self.posw.device
+    
+
     def __str__(self):
-        return f"mesh @{self.path_model}. vtx:{self.pos.shape} on {self.pos.device}"
+        return f"mesh @{self.path_model}. vtx:{self.posw.shape} on {self.posw.device}"
 
     def __repr__(self):
-        return f"mesh @{self.path_model}. vtx:{self.pos.shape} on {self.pos.device}"
+        return f"mesh @{self.path_model}. vtx:{self.posw.shape} on {self.posw.device}"
 
     def set_batchsize(self, batchsize):
         """
@@ -951,9 +1056,11 @@ class Mesh(torch.nn.Module):
             if not key in self.to_process:
                 continue
             if self._batchsize_set is False:
-                vars(self)[key] = torch.stack([vars(self)[key]] * batchsize, dim=0)
+                vars(self)[key] = torch.stack(
+                    [vars(self)[key]] * batchsize, dim=0)
             else:
-                vars(self)[key] = torch.stack([vars(self)[key][0]] * batchsize, dim=0)
+                vars(self)[key] = torch.stack(
+                    [vars(self)[key][0]] * batchsize, dim=0)
 
         for key, value in self._parameters.items():
             if not key in self.to_process:
@@ -966,6 +1073,7 @@ class Mesh(torch.nn.Module):
                 self._parameters[key] = torch.stack(
                     [self._parameters[key][0]] * batchsize, dim=0
                 )
+        self.posw = self.posw.contiguous()
 
         if self._batchsize_set is False:
             self._batchsize_set = True
@@ -990,9 +1098,9 @@ class Mesh(torch.nn.Module):
                 self.tex.device
             )
         else:
-            self.vtx_color = torch.nn.Parameter(self.vtx_color, requires_grad=True).to(
-                self.vtx_color.device
-            )
+            self.vtx_color = torch.nn.Parameter(
+                self.vtx_color, requires_grad=True).to(
+                self.vtx_color.device)
 
     def forward(self):
         """
@@ -1029,6 +1137,7 @@ class Object3D(torch.nn.Module):
         opencv2opengl: bool = True,
         model_path: str = None,
         scale: int = 1,
+        device:str = 'cuda'
     ):
         """
         Args:
@@ -1042,13 +1151,17 @@ class Object3D(torch.nn.Module):
         self.qx = None  # to load on cpu and not gpu
 
         if model_path is None:
-            self.mesh = None    
+            self.mesh = None
         else:
             self.mesh = Mesh(path_model=model_path, scale=scale)
 
         self.set_pose(
-            position, rotation, batchsize, scale=scale, opencv2opengl=opencv2opengl
-        )
+            position,
+            rotation,
+            batchsize,
+            scale=scale,
+            opencv2opengl=opencv2opengl,
+            device=device)
 
     def set_pose(
         self,
@@ -1057,6 +1170,7 @@ class Object3D(torch.nn.Module):
         batchsize: int = 32,
         opencv2opengl: bool = True,
         scale: int = 1,
+        device:str = None
     ):
         """
         Set the pose to new values, the inputs can be either list, numpy or torch.tensor. If the class was put on cuda(), the updated pose should be on the GPU as well.
@@ -1089,22 +1203,27 @@ class Object3D(torch.nn.Module):
         self._position = position
         self._rotation = rotation
 
-        if self.qx is None:
-            device = "cpu"
-        else:
-            device = self.qx.device
-        self.qx = torch.nn.Parameter(torch.ones(batchsize) * rotation[0])
-        self.qy = torch.nn.Parameter(torch.ones(batchsize) * rotation[1])
-        self.qz = torch.nn.Parameter(torch.ones(batchsize) * rotation[2])
-        self.qw = torch.nn.Parameter(torch.ones(batchsize) * rotation[3])
+        # if self.qx is None:
+        #     device = "cpu"
+        # else:
+        #     device = self.qx.device
 
-        self.x = torch.nn.Parameter(torch.ones(batchsize) * position[0])
-        self.y = torch.nn.Parameter(torch.ones(batchsize) * position[1])
-        self.z = torch.nn.Parameter(torch.ones(batchsize) * position[2])
+        # self.qx = torch.nn.Parameter(torch.ones(batchsize) * rotation[0])
+        # self.qy = torch.nn.Parameter(torch.ones(batchsize) * rotation[1])
+        # self.qz = torch.nn.Parameter(torch.ones(batchsize) * rotation[2])
+        # self.qw = torch.nn.Parameter(torch.ones(batchsize) * rotation[3])
+        # self.x = torch.nn.Parameter(torch.ones(batchsize) * position[0])
+        # self.y = torch.nn.Parameter(torch.ones(batchsize) * position[1])
+        # self.z = torch.nn.Parameter(torch.ones(batchsize) * position[2])
 
         self.to(device)
         if not self.mesh is None:
-            self.mesh.cuda()
+            self.mesh.to(device)
+
+    @property
+    def device(self):
+        # return next(self.parameters()).device
+        return self.mesh.device
 
     def set_batchsize(self, batchsize: int):
         """
@@ -1113,35 +1232,106 @@ class Object3D(torch.nn.Module):
         Args:
             batchsize (int): Batchsize to optimize
         """
-        device = self.qx.device
+        # device = self.qx.device
+        device = self.device
         # r6 = r6_from_quat(self._rotation)
 
         quat = th.as_tensor(np.stack([
-                self._rotation[0],
-                self._rotation[1],
-                self._rotation[2],
-                self._rotation[3]], axis=-1),
-                                        dtype=th.float32)
+            self._rotation[0],
+            self._rotation[1],
+            self._rotation[2],
+            self._rotation[3]], axis=-1),
+            dtype=th.float32)
         if RTYPE == 'r6':
             r6 = r6_from_quat(quat)
-            br6 = einops.repeat(r6, '... -> b ...', b = batchsize)
-            self.register_parameter('r6',
-                                    th.nn.Parameter(br6.clone(), requires_grad=True))
+            br6 = einops.repeat(r6, '... -> b ...', b=batchsize)
+            self.register_parameter(
+                'r6', th.nn.Parameter(
+                    br6.clone(), requires_grad=True))
             with th.no_grad():
                 # for testing... (or for testing with perturbations...)
                 # self.r6 += 0.3 * th.randn_like(self.r6)
                 self.r6 /= SCALE
         elif RTYPE == 'quat':
-            self.qx = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[0])
-            self.qy = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[1])
-            self.qz = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[2])
-            self.qw = torch.nn.Parameter(torch.ones(batchsize) * self._rotation[3])
+            self.qx = torch.nn.Parameter(
+                torch.ones(batchsize) * self._rotation[0])
+            self.qy = torch.nn.Parameter(
+                torch.ones(batchsize) * self._rotation[1])
+            self.qz = torch.nn.Parameter(
+                torch.ones(batchsize) * self._rotation[2])
+            self.qw = torch.nn.Parameter(
+                torch.ones(batchsize) * self._rotation[3])
         elif RTYPE == 'd_axa':
             self.register_buffer('q0', quat, False)
             self.d_axa = self.register_parmeter(
-                    'd_axa',
-                    nn.Parameter(torch.zeros((batchsize,3),
-                                             dtype=th.float32)))
+                'd_axa',
+                nn.Parameter(torch.zeros((batchsize, 3),
+                                         dtype=th.float32)))
+        elif RTYPE == 'se3':
+            self.register_buffer('scale',
+                                 th.as_tensor([
+                                     SCALE,SCALE,SCALE,
+                                     1.0,1.0,1.0],
+                                              dtype=th.float32),
+                                 persistent=False)
+            if LOCAL:
+                T0 = th.zeros((batchsize, 4, 4),
+                              dtype=th.float32)
+                self.register_buffer('T0', T0, persistent=False)
+                with th.no_grad():
+                    # rotation
+                    self.T0[..., :3, :3] = matrix_from_quaternion(quat)
+                    # translation
+                    self.T0[..., 0, 3] = self._position[0]
+                    self.T0[..., 1, 3] = self._position[1]
+                    self.T0[..., 2, 3] = self._position[2]
+                    # homogeneous
+                    self.T0[..., 3, 3] = 1
+            if LOCAL:
+                print('make se3')
+                self.register_parameter(
+                    'se3', nn.Parameter(
+                        torch.zeros((batchsize, 6),
+                                    dtype=th.float32)))
+
+                with th.no_grad():
+                    self.se3[..., 0] = 0
+                    self.se3[..., 1] = 0
+                    self.se3[..., 2] = 0
+                    self.se3[..., 3] = 0
+                    self.se3[..., 4] = 0
+                    self.se3[..., 5] = 0
+            else:
+                # global
+                self.register_parameter(
+                    'se3', nn.Parameter(
+                        torch.zeros((batchsize, 6)),
+                        dtype=th.float32))
+                axa = axa_from_quat(quat)
+                assert (axa.shape[-1] == 3)
+                with th.no_grad():
+                    self.se3[..., 0] = self._position[0]
+                    self.se3[..., 1] = self._position[1]
+                    self.se3[..., 2] = self._position[2]
+                    self.se3[..., 4] = axa[..., 0]
+                    self.se3[..., 5] = axa[..., 1]
+                    self.se3[..., 6] = axa[..., 2]
+        for i in range(6):
+            print(SE3.genmat()[i])
+
+        self.register_buffer('g', SE3.genmat(),
+                             persistent=False)
+        self._oe_expr = oe.contract_expression(
+                # subscripts;
+                'njk,ijl,nlk -> ni',
+                # constants;
+                # shapes;
+                (batchsize,4,4),
+                # (6,4,4),
+                self.g,
+                (batchsize,4,4),
+                constants=[1],
+                optimize='optimal')
 
         # self.r0 = torch.nn.Parameter(torch.ones(batchsize) * r6[0])
         # self.r1 = torch.nn.Parameter(torch.ones(batchsize) * r6[1])
@@ -1151,9 +1341,9 @@ class Object3D(torch.nn.Module):
         # self.r5 = torch.nn.Parameter(torch.ones(batchsize) * r6[5])
         # self.r6
 
-        self.x = torch.nn.Parameter(torch.ones(batchsize) * self._position[0])
-        self.y = torch.nn.Parameter(torch.ones(batchsize) * self._position[1])
-        self.z = torch.nn.Parameter(torch.ones(batchsize) * self._position[2])
+        # self.x = torch.nn.Parameter(torch.ones(batchsize) * self._position[0])
+        # self.y = torch.nn.Parameter(torch.ones(batchsize) * self._position[1])
+        # self.z = torch.nn.Parameter(torch.ones(batchsize) * self._position[2])
 
         # p3 = th.as_tensor(np.stack([
         #         self._position[0],
@@ -1173,16 +1363,50 @@ class Object3D(torch.nn.Module):
 
     # def __repr__(self):
     #     # TODO use the function for the argmax
-    #     return f"Object3D( \n (pos): {self.x.shape} ,[0]:[{self.x[0].item(),self.y[0].item(),self.z[0].item()}] on {self.x.device}\n (mesh): {self.mesh} on {self.mesh.pos.device} \n)"
+    # return f"Object3D( \n (pos): {self.x.shape}
+    # ,[0]:[{self.x[0].item(),self.y[0].item(),self.z[0].item()}] on
+    # {self.x.device}\n (mesh): {self.mesh} on {self.mesh.pos.device} \n)"
+
+    def to(self, *args, **kwds):
+        super().to(*args, **kwds)
+        self.mesh.to(*args, **kwds)
+        if hasattr(self, 'se3'):
+            self._oe_expr = oe.contract_expression(
+                    # subscripts;
+                    'njk,ijl,nlk -> ni',
+                    # constants;
+                    # shapes;
+                    (self.se3.shape[0],4,4),
+                    # (6,4,4),
+                    self.g,
+                    (self.se3.shape[0],4,4),
+                    constants=[1],
+                    optimize='optimal')
 
     def cuda(self):
         """
         not sure why I need to wrap this, but I had to for the mesh information
         """
-        super().cuda()
+        return self.to(device='cuda')
+        # super().cuda()
+        # self.mesh.cuda()
+        # # regenerate `oe_expr`
 
-        self.mesh.cuda()
+        # print('send to cuda')
+        # if hasattr(self, 'se3'):
+        #     self._oe_expr = oe.contract_expression(
+        #             # subscripts;
+        #             'njk,ijl,nlk -> ni',
+        #             # constants;
+        #             # shapes;
+        #             (self.se3.shape[0],4,4),
+        #             # (6,4,4),
+        #             self.g,
+        #             (self.se3.shape[0],4,4),
+        #             constants=[1],
+        #             optimize='optimal')
 
+    @th.compile
     def forward(self):
         """
         Return:
@@ -1191,19 +1415,32 @@ class Object3D(torch.nn.Module):
         # q = torch.stack([self.qx, self.qy, self.qz, self.qw], dim=0).T
         # q = q / torch.norm(q, dim=1).reshape(-1, 1)
 
-        # TODO add the dict from object3d to the output of the module.
-        to_return = self.mesh()
-        #to_return["quat"] = q
-        to_return["rot6"] = self.r6
-        # torch.stack([self.r0,
-        #                                  self.r1,
-        #                                  self.r2,
-        #                                  self.r3,
-        #                                  self.r4,
-        #                                  self.r5], dim=-1)
-        # to_return["trans"] = self.pos#torch.stack([self.x, self.y, self.z], dim=0).T
-        to_return["trans"] =torch.stack([self.x, self.y, self.z], dim=0).T
+        # to_return = self.mesh()
 
+        to_return = {}
+        # if RTYPE == 'se3':
+        # se3 = self.se3 * self.scale
+        # print(SE3Exp(se3))
+        # to_return['T'] = self.T0 @ SE3Exp(se3, self._oe_expr)
+        
+
+
+
+        # to_return['T'] = SE3Exp(se3) @ self.T0
+        # print(to_return['T'])
+        # else:
+        #     # TODO add the dict from object3d to the output of the module.
+        #     # to_return["quat"] = q
+        #     to_return["rot6"] = self.r6
+        #     # torch.stack([self.r0,
+        #     #                                  self.r1,
+        #     #                                  self.r2,
+        #     #                                  self.r3,
+        #     #                                  self.r4,
+        #     #                                  self.r5], dim=-1)
+        #     # to_return["trans"] = self.pos#torch.stack([self.x, self.y,
+        #     # self.z], dim=0).T
+        #     to_return["trans"] = torch.stack([self.x, self.y, self.z], dim=0).T
         return to_return
 
 
@@ -1231,7 +1468,8 @@ class Image:
     def __post_init__(self):
         if not self.img_path is None:
             if self.depth:
-                im = cv2.imread(self.img_path, cv2.IMREAD_UNCHANGED) / self.depth_scale
+                im = cv2.imread(self.img_path,
+                                cv2.IMREAD_UNCHANGED) / self.depth_scale
             else:
                 im = cv2.imread(self.img_path)[:, :, :3]
                 im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
@@ -1259,7 +1497,8 @@ class Image:
                         ),
                     )
             self.img_tensor = torch.tensor(im).float()
-            log.info(f"Loaded image {self.img_path}, shape: {self.img_tensor.shape}")
+            log.info(
+                f"Loaded image {self.img_path}, shape: {self.img_tensor.shape}")
         self._batchsize_set = False
 
     def __repr__(self):
@@ -1286,7 +1525,8 @@ class Image:
             self._batchsize_set = True
 
         else:
-            self.img_tensor = torch.stack([self.img_tensor[0]] * batchsize, dim=0)
+            self.img_tensor = torch.stack(
+                [self.img_tensor[0]] * batchsize, dim=0)
 
 
 @dataclass
@@ -1313,7 +1553,8 @@ class Scene:
     def __post_init__(self):
         # load the images and store them correctly
         if not self.path_img is None:
-            self.tensor_rgb = Image(self.path_img, img_resize=self.image_resize)
+            self.tensor_rgb = Image(
+                self.path_img, img_resize=self.image_resize)
         if not self.path_depth is None:
             self.tensor_depth = Image(
                 self.path_depth, img_resize=self.image_resize, depth=True
@@ -1420,7 +1661,6 @@ class DiffDope:
         # load the rendering
         self.glctx = dr.RasterizeGLContext()
         # self.glctx = dr.RasterizeCudaContext()
-        self.cuda()
 
         self.resolution = self.scene.get_resolution()
 
@@ -1436,6 +1676,7 @@ class DiffDope:
             self.gt_tensors["segmentation"] = self.scene.tensor_segmentation.img_tensor
 
         self.set_batchsize(self.batchsize)
+        self.cuda()
 
         # Storing the values for losses display
         self.losses_values = {}
@@ -1528,21 +1769,22 @@ class DiffDope:
                 crop = find_crop(self.gt_tensors["segmentation"][0])
 
             else:
-                crop = find_crop(self.optimization_results[index][render_selection][0])
-        
+                crop = find_crop(
+                    self.optimization_results[index][render_selection][0])
+
         if batch_index is None:
             # make a grid
             if self.cfg.render_images.crop_around_mask:
                 gt_tensor = self.gt_tensors[render_selection][
                     :,
-                    crop[0] : crop[0] + crop[2] + 1,
-                    crop[1] : crop[1] + crop[2] + 1,
+                    crop[0]: crop[0] + crop[2] + 1,
+                    crop[1]: crop[1] + crop[2] + 1,
                     ...,
                 ]
                 gu_tensor = self.optimization_results[index][render_selection][
                     :,
-                    crop[0] : crop[0] + crop[2] + 1,
-                    crop[1] : crop[1] + crop[2] + 1,
+                    crop[0]: crop[0] + crop[2] + 1,
+                    crop[1]: crop[1] + crop[2] + 1,
                     ...,
                 ]
             else:
@@ -1566,14 +1808,14 @@ class DiffDope:
             if self.cfg.render_images.crop_around_mask:
                 gt_tensor = self.gt_tensors[render_selection][
                     batch_index,
-                    crop[0] : crop[0] + crop[2] + 1,
-                    crop[1] : crop[1] + crop[2] + 1,
+                    crop[0]: crop[0] + crop[2] + 1,
+                    crop[1]: crop[1] + crop[2] + 1,
                     ...,
                 ]
                 gu_tensor = self.optimization_results[index][render_selection][
                     batch_index,
-                    crop[0] : crop[0] + crop[2] + 1,
-                    crop[1] : crop[1] + crop[2] + 1,
+                    crop[0]: crop[0] + crop[2] + 1,
+                    crop[1]: crop[1] + crop[2] + 1,
                     ...,
                 ]
             else:
@@ -1607,7 +1849,8 @@ class DiffDope:
 
         tensor_list = []
 
-        # Extract tensors at the last time step for each key and add to the list
+        # Extract tensors at the last time step for each key and add to the
+        # list
         for key, tensor in self.losses_values.items():
             tensor_at_last_time_step = tensor[last_time_step]
             tensor_list.append(tensor_at_last_time_step)
@@ -1624,7 +1867,8 @@ class DiffDope:
 
         return argmin
 
-    def make_animation(self, output_file_path=None, frame_rate=20, batch_index=-1):
+    def make_animation(self, output_file_path=None,
+                       frame_rate=20, batch_index=-1):
         """
         Make an animation of the optimization to be saved. This uses the `render_img` function.
 
@@ -1641,13 +1885,18 @@ class DiffDope:
         # Set the frame rate (change this value as needed)
         frame_rate = 10
 
-        # Get the dimensions of the first image (assuming all images have the same dimensions)
+        # Get the dimensions of the first image (assuming all images have the
+        # same dimensions)
         height, width = self.resolution
 
-        # Create a VideoWriter object to save the MP4 video (use 'XVID' codec for MP4)
+        # Create a VideoWriter object to save the MP4 video (use 'XVID' codec
+        # for MP4)
         writer = imageio.get_writer(
-            output_file_path, mode="I", fps=frame_rate, codec="libx264", bitrate="16M"
-        )
+            output_file_path,
+            mode="I",
+            fps=frame_rate,
+            codec="libx264",
+            bitrate="16M")
 
         if batch_index == -1:
             batch_index = self.get_argmin()
@@ -1707,8 +1956,8 @@ class DiffDope:
         # Plot the batch_index values as lines
         for i, key in enumerate(self.losses_values.keys()):
             plt.plot(
-                dcn(self.losses_values[key][..., batch_index]), marker="o", label=key
-            )
+                dcn(self.losses_values[key][..., batch_index]),
+                marker="o", label=key)
         # plt.show()
         plt.legend()
 
@@ -1756,12 +2005,17 @@ class DiffDope:
             self.object3d.parameters(),
             lr=self.cfg.hyperparameters.learning_rate_base
         )
-        N:int = self.batchsize
+        N: int = self.batchsize
+
+        result = self.object3d.mesh()
         self.oe_expr = oe.contract_expression(
             "nij,njk,npk->npi",
+            # (N, 4, 4),
+            self.camera.cam_proj,
             (N, 4, 4),
-            (N, 4, 4),
-            (N, -1, 4),
+            #(N, -1, 4),
+            result['posw'],
+            constants=[0, 2],
             optimize='optimal'
         )
 
@@ -1772,15 +2026,20 @@ class DiffDope:
         if self.scene.tensor_segmentation is not None:
             self.gt_tensors["segmentation"] = self.scene.tensor_segmentation.img_tensor
 
-
         pbar = tqdm(range(self.cfg.hyperparameters.nb_iterations + 1))
 
         T0 = th.zeros((self.batchsize, 4, 4),
-                          dtype=th.float32,
-                          device=self.object3d.x.device)
+                      dtype=th.float32,
+                      device=self.object3d.device)
         T0[..., 3, 3] = 1
+        gbuf = th.ones((),
+                       dtype=th.float32,
+                       device=next(self.object3d.parameters()).device)
+        result = self.object3d.mesh()
 
         for iteration_now in pbar:
+            is_last_step = (iteration_now == self.cfg.hyperparameters.nb_iterations)
+
             with nvtx.annotate("iter"):
                 itf = iteration_now / self.cfg.hyperparameters.nb_iterations + 1
                 lr = (
@@ -1791,83 +2050,135 @@ class DiffDope:
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = lr
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=False)
+                #result.update(self.object3d())
+                # mtx_gu = result['T']
+                # se3 = self.se3 * self.scale
+                # print(SE3Exp(se3))
+                # to_return['T'] = self.T0 @ SE3Exp(se3, self._oe_expr)
+                if True:#(not is_last_step): # fast-track
+                    with torch.autograd.profiler.profile(False) as prof:
+                        with nvtx.annotate("loss"):
+                            (loss, bloss), mtx_gu, rgb = loss_fn(self.gt_tensors,
+                                    self.camera.cam_proj,
+                                    #result['T'],
 
-                result = self.object3d()
+                                    self.object3d.T0,
+                                    self.object3d.se3,
+                                    self.object3d.scale,
+                                    self.object3d.g,
 
-                # transform quat and position into a matrix44
-                # if 'quat' in result:
-                #     mtx_gu = matrix_batch_44_from_position_quat(
-                #         p=result["trans"], q=result["quat"]
-                #     )
-                # elif 'rot6' in result:
-                #     mtx_gu = matrix_batch_44_from_position_quat(
-                #         p=result["trans"],
-                #         r6=result["rot6"]
-                #     )
-                mtx_gu = th.cat([th.cat(
-                        [matrix_from_r6(result['rot6'] * SCALE),
-                        result['trans'][..., :, None]], dim=-1),
-                                T0[..., 3:, :]], dim=-2)
+                                    result['posw'],
+                                    result['pos_idx'],
+                                    result['uv'],
+                                    result['uv_idx'],
+                                    result['tex'],
+                                    self.learning_rates,
+                                    self.cfg.losses.weight_rgb,
+                                    self.resolution,
+                                    self.glctx)
+                            self.add_loss_value('rgb', bloss)
 
-                # mtx_gu = T0.slice_scatter(
-                #         matrix_from_r6(result['rot6'] * SCALE),
-                #         dim=-2, start=0, end=3)
+                    #prof.export_chrome_trace('trace.json')
 
-                with nvtx.annotate("render"):
-                    if self.object3d.mesh.has_textured_map is False:
-                        self.renders = render_texture_batch(
-                            glctx=self.glctx,
-                            proj_cam=self.camera.cam_proj,
-                            mtx=mtx_gu,
-                            pos=result["pos"],
-                            pos_idx=result["pos_idx"],
-                            vtx_color=result["vtx_color"],
-                            resolution=self.resolution,
-                            oe_expr=self.oe_expr
-                        )
-                    else:
-                        # TODO test the index color version
-                        self.renders = render_texture_batch(
-                            glctx=self.glctx,
-                            proj_cam=self.camera.cam_proj,
-                            mtx=mtx_gu,
-                            pos=result["pos"],
-                            pos_idx=result["pos_idx"],
-                            uv=result["uv"],
-                            uv_idx=result["uv_idx"],
-                            tex=result["tex"],
-                            resolution=self.resolution,
-                            oe_expr=self.oe_expr
-                        )
                     to_add = {}
-                    to_add["rgb"] = self.renders["rgb"].detach()#.cpu()
-                    if self.renders['depth'] is not None:
-                        to_add["depth"] = self.renders["depth"].detach()#.cpu()
-                    else:
-                        to_add["depth"] = None
-                    to_add["mtx"] = mtx_gu.detach()#.cpu()
-
+                    to_add["rgb"] = rgb.detach()  # .cpu()
+                    # if self.renders['depth'] is not None:
+                    #     to_add["depth"] = self.renders["depth"].detach()  # .cpu()
+                    # else:
+                    #     to_add["depth"] = None
+                    to_add["mtx"] = mtx_gu.detach()  # .cpu()
                     self.optimization_results.append(to_add)
+                else:
+                    # transform quat and position into a matrix44
+                    # if 'quat' in result:
+                    #     mtx_gu = matrix_batch_44_from_position_quat(
+                    #         p=result["trans"], q=result["quat"]
+                    #     )
+                    # elif 'rot6' in result:
+                    #     mtx_gu = matrix_batch_44_from_position_quat(
+                    #         p=result["trans"],
+                    #         r6=result["rot6"]
+                    #     )
+                    # if RTYPE == 'se3':
+                    #     mtx_gu = result['T']
+                    # else:
+                    #     mtx_gu = th.cat([th.cat(
+                    #         [matrix_from_r6(result['rot6'] * SCALE),
+                    #          result['trans'][..., :, None]], dim=-1),
+                    #         T0[..., 3:, :]], dim=-2)
 
-                # computing the losses
-                with nvtx.annotate("loss"):
-                    loss = torch.zeros((), device='cuda')#.cuda()
-                    for loss_function in self.loss_functions:
-                        l = loss_function(self)
-                        if l is None:
-                            continue
-                        loss += l
+                    # mtx_gu = T0.slice_scatter(
+                    #         matrix_from_r6(result['rot6'] * SCALE),
+                    #         dim=-2, start=0, end=3)
+
+                    mtx_gu = self.object3d.T0 @ SE3Exp(
+                            self.object3d.se3 * self.object3d.scale, 
+                            elf.object3d.g)
+                    # mtx_gu = SE3Exp(self.object3d.se3 * self.object3d.scale, 
+                    #                 self.object3d.g) @ self.object3d.T0
+
+                    with nvtx.annotate("render"):
+                        if self.object3d.mesh.has_textured_map is False:
+                            self.renders = render_texture_batch(
+                                glctx=self.glctx,
+                                proj_cam=self.camera.cam_proj,
+                                mtx=mtx_gu,
+                                posw=result["posw"],
+                                pos_idx=result["pos_idx"],
+                                vtx_color=result["vtx_color"],
+                                resolution=self.resolution,
+                                oe_expr=self.oe_expr
+                            )
+                        else:
+                            # TODO test the index color version
+                            self.renders = render_texture_batch(
+                                glctx=self.glctx,
+                                proj_cam=self.camera.cam_proj,
+                                mtx=mtx_gu,
+                                posw=result["posw"],
+                                pos_idx=result["pos_idx"],
+                                uv=result["uv"],
+                                uv_idx=result["uv_idx"],
+                                tex=result["tex"],
+                                resolution=self.resolution,
+                                oe_expr=self.oe_expr
+                            )
+                        to_add = {}
+                        to_add["rgb"] = self.renders["rgb"].detach()  # .cpu()
+                        if self.renders['depth'] is not None:
+                            to_add["depth"] = self.renders["depth"].detach()  # .cpu()
+                        else:
+                            to_add["depth"] = None
+                        to_add["mtx"] = mtx_gu.detach()  # .cpu()
+
+                        self.optimization_results.append(to_add)
+
+                    # computing the losses
+                    with nvtx.annotate("loss"):
+                        loss = torch.zeros((), device='cuda')  # .cuda()
+                        for loss_function in self.loss_functions:
+                            l = loss_function(self, log = is_last_step)
+                            print(l.shape)
+                            if l is None:
+                                continue
+                            loss = loss + l
 
                 if False:
                     make_dot(loss, params=dict(self.object3d.named_parameters())).render(
                         '/tmp/docker/diffdope.gv')
 
-                #pbar.set_description(f"loss: {loss.item():.4f}")
-                with nvtx.annotate("backward"):
-                    loss.backward()
+                # pbar.set_description(f"loss: {loss.item():.4f}")
+                gbuf.fill_(1)
+                if not is_last_step:
+                    with torch.autograd.profiler.profile(False) as prof:
+                        with nvtx.annotate("backward"):
+                            loss.backward(gradient=gbuf)
+                            # loss.backward()
+                    # prof.export_chrome_trace('trace.json')
                 with nvtx.annotate("opt.step"):
                     self.optimizer.step()
+        print(loss)
 
     def cuda(self):
         """

@@ -21,6 +21,13 @@ def main(cfg: DictConfig):
     t1=(time.time())
     print('dt', t1-t0)
 
+    # run the optimization
+    t0=(time.time())
+    ddope.run_optimization()
+    ic(ddope.get_argmin(), ddope.get_pose())
+    t1=(time.time())
+    print('dt', t1-t0)
+
     # get the loss plot for the argmin of the optimization
     img_plot = ddope.plot_losses()
     cv2.imwrite("plot.png", img_plot)
