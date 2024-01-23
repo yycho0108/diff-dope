@@ -7,10 +7,15 @@ camera:
     im_width: 640
     im_height: 480
 scene:
-    path_img: /tmp/docker/bulldozer2-imgs/001.png
+    # path_img: /tmp/docker/bulldozer2-imgs/010.png
+    # path_depth: /tmp/docker/bulldozer2-imgs/depth/009.png
+    # path_segmentation: /tmp/docker/bulldozer2-imgs/mask/008.png
+    path_img: /tmp/docker/bulldozer2-imgs/002.png
     path_depth: /tmp/docker/bulldozer2-imgs/depth/001.png
     path_segmentation: /tmp/docker/bulldozer2-imgs/mask/000.png
     image_resize: 0.125
+    # image_resize: 0.25
+    # image_resize: 1.0
 object3d:
     position: [0.11132171, 0.02492679, 0.4459777 ]
     scale: 1.00
@@ -23,15 +28,15 @@ object3d:
 losses:
     l1_rgb_with_mask: true
     weight_rgb: 1.0
-    l1_depth_with_mask: false
-    weight_depth: 0.1
-    l1_mask: false
-    weight_mask: 1.0
+    l1_depth_with_mask: true
+    weight_depth: 0.0
+    l1_mask: true
+    weight_mask: 0.0
 hyperparameters:
     nb_iterations: 8
     batchsize: 64
     base_lr: 20
-    learning_rates_bound: [1.0, 2.0]
+    learning_rates_bound: [0.8, 1.2]
     learning_rate_base: 1
     lr_decay: 0.1
 render_images:

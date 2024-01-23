@@ -67,6 +67,10 @@ SCALE = 10.0
 S_TEX = 0.5
 LOCAL: bool = True
 
+# def apply_crop(scene:Scene, camera:Camera):
+#     seg = scene.tensor_segmentation.img_tensor
+#     i0, j0, box = find_crop(seg)
+    
 
 def matrix_batch_44_from_position_quat(p, q=None, r6=None):
     """
@@ -286,6 +290,7 @@ def render_texture_batch(
         # depth = th.einsum('ni, npi -> np', mtx[..., 2], gb_pos) + mtx[..., 2,3]
         depth = th.matmul(gb_pos, mtx[..., 2, :, None]).squeeze(dim=-1)
         depth = -depth.reshape(shape_keep[:-1])
+        # print(depth[depth != 0].mean())
         # print((depth - depth1).std())
         # print((depth - depth0).std())
         # print(depth.shape)
@@ -294,10 +299,16 @@ def render_texture_batch(
     mask = None
     if False:
         mask, _ = dr.interpolate(
-            # torch.ones(pos_idx.shape).cuda(),
-            th.ones(pos_idx.shape, device='cuda'),
-            rast_out, pos_idx[0], rast_db=rast_out_db, diff_attrs="all")
+                th.ones(pos_idx.shape[:-1] + (1,),
+                        device=pos_idx.device),
+                # th.ones_like(pos_idx[..., :1], dtype=th.float32,
+                #              device=pos_idx.device),
+                rast_out, pos_idx[0], rast_db=rast_out_db, diff_attrs="all"
+        )
+        # print('mask', mask.shape)
+        # needed?
         mask = dr.antialias(mask, rast_out, pos_clip_ja, pos_idx[0])
+        # print('.mask', mask.shape)
 
     # compute vertex color interpolation
     if vtx_color is None:
@@ -336,6 +347,8 @@ def loss_fn(
         tex:th.Tensor,
         learning_rates:th.Tensor,
         weight_rgb:float,
+        weight_depth:float,
+        weight_mask:float,
         resolution:Tuple[int,int],
         # oe_expr,
         glctx
@@ -352,14 +365,38 @@ def loss_fn(
                             uv_idx=uv_idx,
                             tex=tex,
                             resolution=resolution)
-    return l1_rgb_with_mask_t(
+    has_data = (renders['rast_out'][..., -1:] > 0)
+    loss, berr = l1_rgb_with_mask_t(
                 # ddope.renders['rgb'][..., :3],
                 renders['rgb'],
                 gt_tensors['rgb'][..., :3],
-                renders['rast_out'][..., -1:],
+                # renders['rast_out'][..., -1:],
+                has_data,
                 gt_tensors["segmentation"],
                 learning_rates,
-                weight_rgb), mtx_gu, renders['rgb']
+                weight_rgb,
+                #pred_mask = renders['mask'],
+                )
+    #loss = loss + l1_depth_with_mask_t(
+    #        renders['depth'],
+    #        gt_tensors['depth'],
+    #        gt_tensors['segmentation'],
+    #        learning_rates,
+    #        weight_depth,
+    #        # pred_mask = renders['mask'],
+    #        #pred_mask=has_data,
+    #        )
+    
+    #loss = loss + l1_mask_t(
+    #        renders['mask'],
+    #        gt_tensors['segmentation'],
+    #        learning_rates,
+    #        weight_mask)
+
+    # aux = dict(renders)
+    # aux['mtx'] = mtx_gu
+    renders['mtx'] = mtx_gu
+    return (loss, berr), renders
 
 ##############################################################################
 # IMG MANIPULATION
@@ -690,8 +727,17 @@ def l1_rgb_with_mask_t(pred_rgb:th.Tensor,
                        pred_mask: th.Tensor,
                        true_mask:th.Tensor,
                        learning_rates:th.Tensor,
-                       weight_rgb:float) -> th.Tensor:
-    diff_rgb = torch.abs((pred_rgb * (pred_mask>0) - true_rgb) * (true_mask))
+                       weight_rgb:float,
+                       ) -> th.Tensor:
+
+    #if pred_mask is not None:
+    #    diff_rgb = torch.abs(
+    #        (pred_rgb * (pred_mask>0) - true_rgb) * (
+    #            true_mask[..., 0] + pred_mask[...,0]
+    #            )
+    #    )
+    #else:
+    diff_rgb = torch.abs((pred_rgb * (pred_mask) - true_rgb) * (true_mask + pred_mask))
     # lr_diff_rgb = dist_batch_lr(diff_rgb, learning_rates)
     batch_err = diff_rgb.reshape(diff_rgb.shape[0], -1).mean(dim=-1)
     lr_diff_rgb = batch_err * learning_rates
@@ -724,6 +770,34 @@ def l1_rgb_with_mask(ddope, log:bool = False):
     return lr_diff_rgb.mean() * ddope.cfg.losses.weight_rgb
 
 
+def l1_depth_with_mask_t(
+        pred_depth:th.Tensor,
+        true_depth:th.Tensor,
+        true_mask:th.Tensor,
+        learning_rates:th.Tensor,
+        weight_depth:float,
+        pred_mask:Optional[th.Tensor]=None):
+    """
+    Computes the l1_depth on a DiffDOPE object, simpler to pass the object.
+    """
+
+    if pred_mask is not None:
+        diff_depth = torch.abs(
+            (pred_depth - true_depth) * (
+                true_mask[..., 0] + pred_mask[...,0].detach())
+        )
+    else:
+        diff_depth = torch.abs(
+            (pred_depth - true_depth) * true_mask[..., 0]
+        )
+    # lr_diff_depth = dist_batch_lr(diff_depth, ddope.learning_rates, [1, 2])
+    batch_err = diff_depth.reshape(diff_depth.shape[0], -1).mean(dim=-1)
+    lr_diff_depth = batch_err * learning_rates
+    # ddope.add_loss_value(
+    #     "depth", torch.mean(
+    #         diff_depth.detach(), (1, 2)) * ddope.cfg.losses.weight_depth)
+    return lr_diff_depth.mean() * weight_depth
+
 def l1_depth_with_mask(ddope):
     """
     Computes the l1_depth on a DiffDOPE object, simpler to pass the object.
@@ -741,6 +815,15 @@ def l1_depth_with_mask(ddope):
 
     return lr_diff_depth.mean() * ddope.cfg.losses.weight_depth
 
+def l1_mask_t(pred_mask:th.Tensor,
+              true_mask:th.Tensor,
+              learning_rates:th.Tensor,
+              weight_mask:float):
+    # print(pred_mask.shape, true_mask.shape)
+    diff_mask = torch.abs( (pred_mask[...,0] - true_mask[...,0]))
+    batch_err = diff_mask.reshape(diff_mask.shape[0], -1).mean(dim=-1)
+    lr_diff_mask = batch_err * learning_rates
+    return lr_diff_mask.mean() * weight_mask
 
 def l1_mask(ddope):
     """
@@ -757,7 +840,7 @@ def l1_mask(ddope):
     ddope.optimization_results[-1]["mask"] = mask.detach()  # .cpu()
 
     # Compute the difference between the mask and ground truth segmentation
-    diff_mask = torch.abs(mask - ddope.gt_tensors["segmentation"])
+    diff_mask = torch.abs(mask - ddope.gt_tensors["segmentation"][...,0])
 
     # Compute the L1-on mask loss with batch-wise learning rates
     lr_diff_mask = dist_batch_lr(diff_mask, ddope.learning_rates)
@@ -832,12 +915,16 @@ class Camera:
         Args:
             percentage (float): bounded between [0,1]
         """
+        # raise ValueError("!")
+        # print('percentage', percentage)
         self.fx *= percentage
         self.fy *= percentage
-        self.cx = (int)(percentage * self.cx)
-        self.cy = (int)(percentage * self.cy)
-        self.im_width = (int)(percentage * self.im_width)
-        self.im_height = (int)(percentage * self.im_height)
+        self.cx = percentage * self.cx
+        self.cy = percentage * self.cy
+        self.im_width = percentage * self.im_width
+        self.im_height = percentage * self.im_height
+        # print('>>>>>>>>>>>>>>RESZ')
+        self.cam_proj = self.get_projection_matrix()
 
     def get_projection_matrix(self):
         """
@@ -852,8 +939,9 @@ class Camera:
         Returns:
             torch.tensor: a 4x4 projection matrix in OpenGL coordinate frame
         """
-
+        print('>>>>>>>>>>>>>>PROJ')
         K = np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1]])
+        # print('K', K)
         x0 = 0
         y0 = 0
         w = self.im_width
@@ -902,6 +990,7 @@ class Camera:
                     [0, 0, -1, 0],
                 ]
             )
+        print('proj', proj)
 
         return torch.tensor(proj)
 
@@ -1250,7 +1339,7 @@ class Object3D(torch.nn.Module):
                     br6.clone(), requires_grad=True))
             with th.no_grad():
                 # for testing... (or for testing with perturbations...)
-                # self.r6 += 0.3 * th.randn_like(self.r6)
+                # self.r6 += 0.5 * th.randn_like(self.r6)
                 self.r6 /= SCALE
         elif RTYPE == 'quat':
             self.qx = torch.nn.Parameter(
@@ -1301,6 +1390,11 @@ class Object3D(torch.nn.Module):
                     self.se3[..., 3] = 0
                     self.se3[..., 4] = 0
                     self.se3[..., 5] = 0
+                    if True:
+                        # rot; std around 6 deg.
+                        self.se3[..., 0:3].normal_(0.0, 0.1 / SCALE)
+                        # trans
+                        self.se3[..., 3:6].normal_(0.0, 0.01)
             else:
                 # global
                 self.register_parameter(
@@ -1475,6 +1569,7 @@ class Image:
                 im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
                 # normalize
                 im = im / 255.0
+
             if self.flip_img:
                 im = cv2.flip(im, 0)
 
@@ -1545,6 +1640,7 @@ class Scene:
     path_depth: Optional[str] = None
     path_segmentation: Optional[str] = None
     image_resize: Optional[float] = None
+    image_crop: Optional[bool] = False
 
     tensor_rgb: Optional[Image] = None
     tensor_depth: Optional[Image] = None
@@ -1552,16 +1648,17 @@ class Scene:
 
     def __post_init__(self):
         # load the images and store them correctly
+        if not self.path_segmentation is None:
+            self.tensor_segmentation = Image(
+                self.path_segmentation,
+                img_resize=self.image_resize
+            )
         if not self.path_img is None:
             self.tensor_rgb = Image(
                 self.path_img, img_resize=self.image_resize)
         if not self.path_depth is None:
             self.tensor_depth = Image(
                 self.path_depth, img_resize=self.image_resize, depth=True
-            )
-        if not self.path_segmentation is None:
-            self.tensor_segmentation = Image(
-                self.path_segmentation, img_resize=self.image_resize
             )
 
     def set_batchsize(self, batchsize):
@@ -1651,11 +1748,15 @@ class DiffDope:
         if self.camera is None:
             # load the camera from the config
             self.camera = Camera(**self.cfg.camera)
+            #if self.cfg.scene.image_resize is not None:
+            #    self.camera.resize(self.cfg.scene.image_resize)
         # print(self.pose.position)
         if self.object3d is None:
             self.object3d = Object3D(**self.cfg.object3d)
         if self.scene is None:
             self.scene = Scene(**self.cfg.scene)
+        # if True:
+        #     self.scene, self.camera = apply_crop(self.scene, self.camera)
         self.batchsize = self.cfg.hyperparameters.batchsize
 
         # load the rendering
@@ -1805,8 +1906,12 @@ class DiffDope:
 
             return img
         else:
+            k_gt = render_selection
+            if render_selection == 'mask':
+                k_gt = 'segmentation'
+                
             if self.cfg.render_images.crop_around_mask:
-                gt_tensor = self.gt_tensors[render_selection][
+                gt_tensor = self.gt_tensors[k_gt][
                     batch_index,
                     crop[0]: crop[0] + crop[2] + 1,
                     crop[1]: crop[1] + crop[2] + 1,
@@ -1819,7 +1924,7 @@ class DiffDope:
                     ...,
                 ]
             else:
-                gt_tensor = self.gt_tensors[render_selection][batch_index]
+                gt_tensor = self.gt_tensors[k_gt][batch_index]
                 gu_tensor = self.optimization_results[index][render_selection][
                     batch_index
                 ]
@@ -1906,7 +2011,8 @@ class DiffDope:
         for iteration_now in pbar:
             pbar.set_description("making video")
             # Ensure the image is in BGR format (OpenCV default)
-            img = self.render_img(index=iteration_now, batch_index=batch_index)
+            img = self.render_img(index=iteration_now, batch_index=batch_index,
+                                  render_selection='rgb')
             writer.append_data(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
         # Release the VideoWriter to save the MP4 video
@@ -2037,6 +2143,7 @@ class DiffDope:
                        device=next(self.object3d.parameters()).device)
         result = self.object3d.mesh()
 
+        print(self.camera.cam_proj)
         for iteration_now in pbar:
             is_last_step = (iteration_now == self.cfg.hyperparameters.nb_iterations)
 
@@ -2059,7 +2166,7 @@ class DiffDope:
                 if True:#(not is_last_step): # fast-track
                     with torch.autograd.profiler.profile(False) as prof:
                         with nvtx.annotate("loss"):
-                            (loss, bloss), mtx_gu, rgb = loss_fn(self.gt_tensors,
+                            (loss, bloss), aux = loss_fn(self.gt_tensors,
                                     self.camera.cam_proj,
                                     #result['T'],
 
@@ -2075,19 +2182,24 @@ class DiffDope:
                                     result['tex'],
                                     self.learning_rates,
                                     self.cfg.losses.weight_rgb,
+                                    self.cfg.losses.weight_depth,
+                                    self.cfg.losses.weight_mask,
                                     self.resolution,
                                     self.glctx)
                             self.add_loss_value('rgb', bloss)
 
                     #prof.export_chrome_trace('trace.json')
+                    # print(aux.keys())
 
                     to_add = {}
-                    to_add["rgb"] = rgb.detach()  # .cpu()
+                    to_add.update({k:(v.detach() if isinstance(v,th.Tensor) else None) for k,v in aux.items()})
+                    mtx_gu = aux['mtx'].detach()
+                    # to_add["rgb"] = rgb.detach()  # .cpu()
                     # if self.renders['depth'] is not None:
                     #     to_add["depth"] = self.renders["depth"].detach()  # .cpu()
                     # else:
                     #     to_add["depth"] = None
-                    to_add["mtx"] = mtx_gu.detach()  # .cpu()
+                    # to_add["mtx"] = mtx_gu.detach()  # .cpu()
                     self.optimization_results.append(to_add)
                 else:
                     # transform quat and position into a matrix44
@@ -2114,7 +2226,7 @@ class DiffDope:
 
                     mtx_gu = self.object3d.T0 @ SE3Exp(
                             self.object3d.se3 * self.object3d.scale, 
-                            elf.object3d.g)
+                            self.object3d.g)
                     # mtx_gu = SE3Exp(self.object3d.se3 * self.object3d.scale, 
                     #                 self.object3d.g) @ self.object3d.T0
 
@@ -2178,6 +2290,14 @@ class DiffDope:
                     # prof.export_chrome_trace('trace.json')
                 with nvtx.annotate("opt.step"):
                     self.optimizer.step()
+                if True:
+                    with th.no_grad():
+                        self.object3d.T0 = self.object3d.T0 @ SE3Exp(
+                            self.object3d.se3 * self.object3d.scale, 
+                            self.object3d.g)
+                        self.object3d.se3.fill_(0)
+                        # self.object3d.se3[..., 0:3].normal_(std=0.03)
+                        # self.object3d.se3[..., 3:6].normal_(std=0.003)
         print(loss)
 
     def cuda(self):
