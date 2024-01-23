@@ -2290,7 +2290,10 @@ class DiffDope:
                     # prof.export_chrome_trace('trace.json')
                 with nvtx.annotate("opt.step"):
                     self.optimizer.step()
-                if True:
+
+                # option: apply T0
+                # alternatively just keep se3 as-is around the ref.point
+                if False:
                     with th.no_grad():
                         self.object3d.T0 = self.object3d.T0 @ SE3Exp(
                             self.object3d.se3 * self.object3d.scale, 
