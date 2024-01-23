@@ -181,6 +181,7 @@ def interpolate(attr, rast, attr_idx, rast_db=None):
     )
 
 
+# @th.jit.script
 def render_texture_batch(
     glctx,
     proj_cam,
@@ -299,10 +300,10 @@ def render_texture_batch(
         #     texd,
         #     filter_mode="linear",
         # )
-        color = color * torch.clamp(rast_out[..., -1:], 0, 1)  # Mask out background.
+        color = color * (rast_out[..., -1:] > 0)  # Mask out background.
     else:
         color, _ = dr.interpolate(vtx_color, rast_out, pos_idx[0])
-        color = color * torch.clamp(rast_out[..., -1:], 0, 1)  # Mask out background.
+        color = color * (rast_out[..., -1:] > 0)  # Mask out background.
     if not return_rast_out:
         rast_out = None
     return {"rgb": color, "depth": depth, "rast_out": rast_out, 'mask':mask}
@@ -1418,6 +1419,7 @@ class DiffDope:
 
         # load the rendering
         self.glctx = dr.RasterizeGLContext()
+        # self.glctx = dr.RasterizeCudaContext()
         self.cuda()
 
         self.resolution = self.scene.get_resolution()
