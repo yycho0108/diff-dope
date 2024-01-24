@@ -31,12 +31,12 @@ losses:
     l1_depth_with_mask: true
     weight_depth: 0.0
     l1_mask: true
-    weight_mask: 0.0
+    weight_mask: 1.0
 hyperparameters:
-    nb_iterations: 8
+    nb_iterations: 1000
     batchsize: 64
     base_lr: 20
-    learning_rates_bound: [0.8, 1.2]
+    learning_rates_bound: [0.1, 1.2]
     learning_rate_base: 1
     lr_decay: 0.1
 render_images:
@@ -47,4 +47,4 @@ render_images:
     add_countour: true
     color_countour: [0.46, 0.73, 0]
     flip_result: true
-    crop_around_mask: true
+    crop_around_mask: false

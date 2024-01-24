@@ -72,55 +72,6 @@ LOCAL: bool = True
 #     i0, j0, box = find_crop(seg)
     
 
-def matrix_batch_44_from_position_quat(p, q=None, r6=None):
-    """
-    Convert a batched position and quaternion into a batch matrix while keeping the gradients intact.
-
-    Args:
-        p (torch.tensor): (batch,3) translation vector
-        q (torch.tensor): (batch,4) quaternion in x,y,z,w
-
-    Return:
-        returns a (batch,4,4) torch tensor that keeps the gradients intact
-    """
-    if q is not None:
-        r0 = torch.stack(
-            [
-                1.0 - 2.0 * q[:, 1] ** 2 - 2.0 * q[:, 2] ** 2,
-                2.0 * q[:, 0] * q[:, 1] - 2.0 * q[:, 2] * q[:, 3],
-                2.0 * q[:, 0] * q[:, 2] + 2.0 * q[:, 1] * q[:, 3],
-            ],
-            dim=1,
-        )
-        r1 = torch.stack(
-            [
-                2.0 * q[:, 0] * q[:, 1] + 2.0 * q[:, 2] * q[:, 3],
-                1.0 - 2.0 * q[:, 0] ** 2 - 2.0 * q[:, 2] ** 2,
-                2.0 * q[:, 1] * q[:, 2] - 2.0 * q[:, 0] * q[:, 3],
-            ],
-            dim=1,
-        )
-        r2 = torch.stack(
-            [
-                2.0 * q[:, 0] * q[:, 2] - 2.0 * q[:, 1] * q[:, 3],
-                2.0 * q[:, 1] * q[:, 2] + 2.0 * q[:, 0] * q[:, 3],
-                1.0 - 2.0 * q[:, 0] ** 2 - 2.0 * q[:, 1] ** 2,
-            ],
-            dim=1,
-        )
-        rr = torch.stack([r0, r1, r2], dim=1)
-    else:
-        rr = matrix_from_r6(r6 * SCALE)
-    aa = torch.stack([p[:, 0], p[:, 1], p[:, 2]], dim=1).reshape(-1, 3, 1)
-    rr = torch.cat([rr, aa], dim=2)  # Pad right column.
-    aa = torch.stack(
-        [torch.tensor([0, 0, 0, 1], dtype=torch.float32).cuda()] * aa.shape[0], dim=0
-    )
-    rr = torch.cat([rr, aa.reshape(-1, 1, 4)], dim=1)  # Pad bottom row.
-
-    return rr
-
-
 def opencv_2_opengl(p, q):
     """
     Converts a pose from the OpenCV coordinate system to the OpenGL coordinate system.
@@ -387,16 +338,17 @@ def loss_fn(
     #        #pred_mask=has_data,
     #        )
     
-    #loss = loss + l1_mask_t(
-    #        renders['mask'],
-    #        gt_tensors['segmentation'],
-    #        learning_rates,
-    #        weight_mask)
+    # loss = loss + l1_mask_t(
+    #         renders['mask'],
+    #         gt_tensors['segmentation'],
+    #         learning_rates,
+    #         weight_mask)
 
     # aux = dict(renders)
     # aux['mtx'] = mtx_gu
-    renders['mtx'] = mtx_gu
-    return (loss, berr), renders
+
+    # renders['mtx'] = mtx_gu
+    return (loss, berr), None
 
 ##############################################################################
 # IMG MANIPULATION
@@ -439,6 +391,47 @@ def find_crop(img_tensor, percentage=0.1):
 
     return [top_row, left_col, crop_size]
 
+@torch.no_grad()
+def find_crop_2(img_tensor, percentage=0.1):
+    """
+    Find the bounding crop in an image, assuming it finds where there is non-zero.
+
+    Args:
+        img_tensor: Input image tensor
+
+    Returns:
+        list: [top_row, left_col, size]
+    """
+
+    img_tensor = (img_tensor > 0).float()
+
+    # Find the bounding box of the img_tensor
+    rows, cols = torch.nonzero(img_tensor[..., 0], as_tuple=True)
+    top_row, left_col = rows.min(), cols.min()
+    bottom_row, right_col = rows.max(), cols.max()
+
+    # Calculate the wiggle room for each dimension (percentage of the
+    # width/height)
+    wiggle_room_rows = int((bottom_row - top_row + 1) * percentage)
+    wiggle_room_cols = int((right_col - left_col + 1) * percentage)
+
+    # Expand the bounding box by the wiggle room
+    top_row = max(0, top_row - wiggle_room_rows)
+    left_col = max(0, left_col - wiggle_room_cols)
+    bottom_row = min(img_tensor.shape[0] - 1, bottom_row + wiggle_room_rows)
+    right_col = min(img_tensor.shape[1] - 1, right_col + wiggle_room_cols)
+
+    # Calculate the size of the square crop as the minimum of the expanded
+    # height and width
+    crop_size = max(bottom_row - top_row, right_col - left_col)
+
+    return [top_row, left_col, bottom_row - top_row, right_col - left_col]
+
+#@torch.no_grad()
+def apply_crop_np(x: np.ndarray, crop:Tuple[float,float,float]):
+    i0, j0, di,dj = [int(x) for x in crop]
+    print(i0, j0, di, dj)
+    return x[i0:i0+di+1, j0:j0+dj+1]
 
 # def getimg_stack(color_imgs, depth=False, depth_max=3, w=1, h=1):
 #     if depth:
@@ -737,11 +730,15 @@ def l1_rgb_with_mask_t(pred_rgb:th.Tensor,
     #            )
     #    )
     #else:
-    diff_rgb = torch.abs((pred_rgb * (pred_mask) - true_rgb) * (true_mask + pred_mask))
+
+    # diff_rgb = torch.abs((pred_rgb * (pred_mask) - true_rgb) * (true_mask + pred_mask))
+    diff_rgb = torch.abs((pred_rgb * (pred_mask) - true_rgb) * (true_mask))
+
     # lr_diff_rgb = dist_batch_lr(diff_rgb, learning_rates)
     batch_err = diff_rgb.reshape(diff_rgb.shape[0], -1).mean(dim=-1)
     lr_diff_rgb = batch_err * learning_rates
-    return lr_diff_rgb.mean() * weight_rgb, batch_err
+    # return lr_diff_rgb.mean() * weight_rgb, batch_err
+    return lr_diff_rgb.mean() * weight_rgb, None
 
 
 def l1_rgb_with_mask(ddope, log:bool = False):
@@ -890,7 +887,16 @@ class Camera:
     znear: Optional[float] = 0.01
     zfar: Optional[float] = 200
 
+    box_width:Optional[int] = None
+    box_height:Optional[int] = None
+    x0:int=0
+    y0:int=0
+
     def __post_init__(self):
+        if self.box_width is None:
+            self.box_width = self.im_width
+        if self.box_height is None:
+            self.box_height = self.im_height
         self.cam_proj = self.get_projection_matrix()
 
     def set_batchsize(self, batchsize):
@@ -908,6 +914,39 @@ class Camera:
     def cuda(self):
         self.cam_proj = self.cam_proj.cuda().float()
 
+    def crop(self, param):
+        i0, j0, di, dj = [int(x) for x in param]
+        # self.cx -= i0
+        # self.cy -= j0
+        # self.cx += i0
+        # self.cy += j0
+        self.cx = self.cx - j0
+        self.cy = self.cy - i0
+        # self.x0 = self.x0 - j0
+        # self.y0 = self.y0 - i0
+
+
+        # JUST because of the K[0,0]/w logic
+        # we need to premultiply fx/fy
+        # by
+        # fx'/s == fx/true_width
+        # fx' = fx*s/true_width
+        # self.fx *= s / self.im_width
+        # self.fy *= s / self.im_height
+
+        self.box_width = dj
+        self.box_height = di
+        # self.cx += j0
+        # self.cy += i0
+
+        # NOTE(ycho): technically 
+        # self.im_width = self.im_height = s,
+        # but get_projection_matrix()
+        # computes projection mat. params
+        # based on the original shape
+        # so I think we should leave this as-is
+        self.cam_proj = self.get_projection_matrix()
+
     def resize(self, percentage):
         """
         If you resize the images for the optimization
@@ -921,8 +960,12 @@ class Camera:
         self.fy *= percentage
         self.cx = percentage * self.cx
         self.cy = percentage * self.cy
+        self.x0 *= percentage
+        self.y0 *= percentage
         self.im_width = percentage * self.im_width
         self.im_height = percentage * self.im_height
+        self.box_width = percentage * self.box_width
+        self.box_height = percentage * self.box_height
         # print('>>>>>>>>>>>>>>RESZ')
         self.cam_proj = self.get_projection_matrix()
 
@@ -942,10 +985,13 @@ class Camera:
         print('>>>>>>>>>>>>>>PROJ')
         K = np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1]])
         # print('K', K)
-        x0 = 0
-        y0 = 0
+        x0 = self.x0
+        y0 = self.y0
         w = self.im_width
         h = self.im_height
+        print(x0, y0, w, h)
+        bw = self.box_width
+        bh = self.box_height
         nc = self.znear
         fc = self.zfar
 
@@ -958,34 +1004,53 @@ class Camera:
         # Draw our images upside down, so that all the pixel-based coordinate
         # systems are the same.
         if window_coords == "y_up":
-            proj = np.array(
-                [
-                    [
-                        2 * K[0, 0] / w,
-                        -2 * K[0, 1] / w,
-                        (-2 * K[0, 2] + w + 2 * x0) / w,
-                        0,
-                    ],
-                    [0, -2 * K[1, 1] / h, (-2 * K[1, 2] + h + 2 * y0) / h, 0],
-                    [0, 0, q, qn],  # Sets near and far planes (glPerspective).
-                    [0, 0, -1, 0],
-                ]
-            )
+            # proj = np.array(
+            #     [
+            #         [
+            #             2 * K[0, 0] / w,
+            #             -2 * K[0, 1] / w,
+            #             (-2 * K[0, 2] + w + 2 * x0) / w,
+            #             0,
+            #         ],
+            #         [0,
+            #          -2 * K[1, 1] / h,
+            #          (-2 * K[1, 2] + h + 2 * y0) / h,
+            #          0],
+            #         [0, 0, q, qn],  # Sets near and far planes (glPerspective).
+            #         [0, 0, -1, 0],
+            #     ]
+            # )
+            pass
+
+        # 2 * K[0,0] / w == (rightmost + leftmost) / (rightmost - leftmost)
+
+        # -2 * K[0,2] + w + 2 * x0 / w == (right+left) / (right-left)
+        # -2 * cx + w + 2 * x0 / w
+
+        # "left" = x0
+        # "right" = x0 + w
+        # "center(?)" = -2*cx << wat is dis
 
         # Draw the images upright and modify the projection matrix so that OpenGL
         # will generate window coords that compensate for the flipped image
         # coords.
         else:
+            # proj(K, x) == proj(K', x) - (i0, j0)
             assert window_coords == "y_down"
+            # print((-2 * K[0, 2] + w + 2 * x0) / w)
             proj = np.array(
                 [
                     [
-                        2 * K[0, 0] / w,
-                        -2 * K[0, 1] / w,
-                        (-2 * K[0, 2] + w + 2 * x0) / w,
+                        2 * K[0, 0] / bw, 
+                        # -2 * K[0, 1] / bw,
+                        0,
+                        (-2 * K[0, 2] + bw + 2 * x0) / bw,
                         0,
                     ],
-                    [0, 2 * K[1, 1] / h, (2 * K[1, 2] - h + 2 * y0) / h, 0],
+                    [0,
+                     2 * K[1, 1] / bh,
+                     (2 * K[1, 2] - bh - 2 * y0) / bh,
+                     0],
                     [0, 0, q, qn],  # Sets near and far planes (glPerspective).
                     [0, 0, -1, 0],
                 ]
@@ -1555,6 +1620,7 @@ class Image:
     img_path: Optional[str] = None
     img_tensor: Optional[torch.tensor] = None
     img_resize: Optional[float] = 1
+    img_crop: Optional[Tuple[float,float,float,float]] = None
     flip_img: Optional[bool] = True
     depth: Optional[bool] = False
     depth_scale: Optional[float] = 100
@@ -1570,10 +1636,15 @@ class Image:
                 # normalize
                 im = im / 255.0
 
+            if self.img_crop is not None:
+                im = apply_crop_np(im, self.img_crop)
+                print('im(crop)', im.shape)
+
             if self.flip_img:
                 im = cv2.flip(im, 0)
+                print('im(flip)', im.shape)
 
-            if self.img_resize < 1.0:
+            if True:#self.img_resize < 1.0:
                 if self.depth:
                     im = cv2.resize(
                         im,
@@ -1640,26 +1711,89 @@ class Scene:
     path_depth: Optional[str] = None
     path_segmentation: Optional[str] = None
     image_resize: Optional[float] = None
-    image_crop: Optional[bool] = False
 
     tensor_rgb: Optional[Image] = None
     tensor_depth: Optional[Image] = None
     tensor_segmentation: Optional[Image] = None
 
+    crop: Optional[Tuple[float,float,float,float]] = None
+
     def __post_init__(self):
         # load the images and store them correctly
+        CROP:bool = True
+        crop = None
         if not self.path_segmentation is None:
+            print('load(seg)')
             self.tensor_segmentation = Image(
                 self.path_segmentation,
                 img_resize=self.image_resize
             )
+            if CROP:
+                # ===> crop( resize(flip(x)) )
+
+                # Some padding seems useful to avoid degeneracies
+                # (like the object flying away)
+                crop = find_crop_2(self.tensor_segmentation.img_tensor,
+                                   percentage = 0.25)
+                # crop = (0, 20, 60, 60)
+                print('crop', crop)
+
+                # since the crop has been found _after_
+                # resize() and flip() ...
+                # currently it looks like crop(resize(flip()))
+
+                # undo resize()
+                if self.image_resize is not None:
+                    crop = [x / self.image_resize for x in crop] 
+                h = (
+                        self.tensor_segmentation.img_tensor.shape[0]
+                        / self.image_resize)
+                print('h', h)
+                print(h, crop[0], crop[2])
+                # crop is given in "unflipped" version
+                crop = [h-crop[0]-crop[2],
+                        crop[1],
+                        crop[2],
+                        crop[3]] # undo flip()
+                print('crop', crop)
+                # reload with crop pre-applied;
+                # so that we can load resize(crop(flip()))
+                # instead of the other way around,
+                # i.e. crop(resize(flip())).
+                print('load_2(seg)')
+
+                # Overwrite image_resize() based on the
+                # newfound(?) dimensions
+                #self.image_resize = (
+                #        self.tensor_segmentation.img_tensor.shape[0] / crop[2]
+                #)
+                self.image_resize = min(1.0,
+                                        self.tensor_segmentation.img_tensor.shape[0] / crop[2]
+                                        )
+                # self.image_resize = 1.0 # hmm
+                self.tensor_segmentation = Image(
+                    self.path_segmentation,
+                    img_resize=self.image_resize,
+                    img_crop = crop
+                )
         if not self.path_img is None:
+            print('load(rgb)')
             self.tensor_rgb = Image(
-                self.path_img, img_resize=self.image_resize)
+                self.path_img,
+                img_resize=self.image_resize,
+                img_crop =crop
+                )
         if not self.path_depth is None:
+            print('load(depth)')
             self.tensor_depth = Image(
-                self.path_depth, img_resize=self.image_resize, depth=True
+                self.path_depth,
+                img_resize=self.image_resize,
+                depth=True,
+                img_crop = crop
             )
+
+        if CROP:
+            self.crop = crop
 
     def set_batchsize(self, batchsize):
         """
@@ -1745,16 +1879,32 @@ class DiffDope:
     # driven by the cfg
 
     def __post_init__(self):
-        if self.camera is None:
-            # load the camera from the config
-            self.camera = Camera(**self.cfg.camera)
-            #if self.cfg.scene.image_resize is not None:
-            #    self.camera.resize(self.cfg.scene.image_resize)
-        # print(self.pose.position)
         if self.object3d is None:
             self.object3d = Object3D(**self.cfg.object3d)
         if self.scene is None:
             self.scene = Scene(**self.cfg.scene)
+        if self.camera is None:
+            # load the camera from the config
+            self.camera = Camera(**self.cfg.camera,
+                                 # resize = self.scene.image_resize,
+                                 # crop = self.scene.crop
+                                 )
+            # if self.scene.crop is not None:
+            #     self.camera.crop(self.scene.crop)
+            # if self.scene.resize is not None:
+            #     self.camera.resize(self.scene.crop)
+            print('ORIGINAL')
+            self.camera.get_projection_matrix()
+
+            print('CROP')
+            if self.scene.crop is not None:
+                self.camera.crop(self.scene.crop)
+
+            print('RESIZE')
+            if self.scene.image_resize is not None:
+               self.camera.resize(self.scene.image_resize)
+
+        # print(self.pose.position)
         # if True:
         #     self.scene, self.camera = apply_crop(self.scene, self.camera)
         self.batchsize = self.cfg.hyperparameters.batchsize
@@ -1928,6 +2078,8 @@ class DiffDope:
                 gu_tensor = self.optimization_results[index][render_selection][
                     batch_index
                 ]
+            print(gt_tensor.shape,
+                  gu_tensor.shape)
 
             img = make_grid_overlay_batch(
                 background=gt_tensor.unsqueeze(0),
@@ -2134,20 +2286,33 @@ class DiffDope:
 
         pbar = tqdm(range(self.cfg.hyperparameters.nb_iterations + 1))
 
-        T0 = th.zeros((self.batchsize, 4, 4),
-                      dtype=th.float32,
-                      device=self.object3d.device)
-        T0[..., 3, 3] = 1
+        # T0 = th.zeros((self.batchsize, 4, 4),
+                      # dtype=th.float32,
+                      # device=self.object3d.device)
+        # T0[..., 3, 3] = 1
         gbuf = th.ones((),
                        dtype=th.float32,
                        device=next(self.object3d.parameters()).device)
         result = self.object3d.mesh()
+        (posw, pos_idx,
+         uv, uv_idx, tex) = (
+                 result['posw'],
+                 result['pos_idx'],
+                 result['uv'],
+                 result['uv_idx'],
+                 result['tex']
+                 )
 
-        print(self.camera.cam_proj)
+        K = self.camera.cam_proj
+        w_r = self.cfg.losses.weight_rgb
+        w_d = self.cfg.losses.weight_depth
+        w_m = self.cfg.losses.weight_mask
+        # print(self.camera.cam_proj)
         for iteration_now in pbar:
             is_last_step = (iteration_now == self.cfg.hyperparameters.nb_iterations)
 
             with nvtx.annotate("iter"):
+                # == learning rates configuration ==
                 itf = iteration_now / self.cfg.hyperparameters.nb_iterations + 1
                 lr = (
                     self.cfg.hyperparameters.base_lr
@@ -2157,7 +2322,9 @@ class DiffDope:
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = lr
 
+                # == zero-grad  ==
                 self.optimizer.zero_grad(set_to_none=False)
+
                 #result.update(self.object3d())
                 # mtx_gu = result['T']
                 # se3 = self.se3 * self.scale
@@ -2166,8 +2333,9 @@ class DiffDope:
                 if True:#(not is_last_step): # fast-track
                     with torch.autograd.profiler.profile(False) as prof:
                         with nvtx.annotate("loss"):
-                            (loss, bloss), aux = loss_fn(self.gt_tensors,
-                                    self.camera.cam_proj,
+                            (loss, bloss), aux = loss_fn(
+                                    self.gt_tensors,
+                                    K,
                                     #result['T'],
 
                                     self.object3d.T0,
@@ -2175,32 +2343,33 @@ class DiffDope:
                                     self.object3d.scale,
                                     self.object3d.g,
 
-                                    result['posw'],
-                                    result['pos_idx'],
-                                    result['uv'],
-                                    result['uv_idx'],
-                                    result['tex'],
+                                    posw,
+                                    pos_idx,
+                                    uv,
+                                    uv_idx,
+                                    tex,
+
                                     self.learning_rates,
-                                    self.cfg.losses.weight_rgb,
-                                    self.cfg.losses.weight_depth,
-                                    self.cfg.losses.weight_mask,
+                                    w_r,
+                                    w_d,
+                                    w_m,
                                     self.resolution,
                                     self.glctx)
-                            self.add_loss_value('rgb', bloss)
+                            #self.add_loss_value('rgb', bloss)
 
                     #prof.export_chrome_trace('trace.json')
                     # print(aux.keys())
 
-                    to_add = {}
-                    to_add.update({k:(v.detach() if isinstance(v,th.Tensor) else None) for k,v in aux.items()})
-                    mtx_gu = aux['mtx'].detach()
+                    # to_add = {}
+                    # to_add.update({k:(v.detach() if isinstance(v,th.Tensor) else None) for k,v in aux.items()})
+                    # mtx_gu = aux['mtx'].detach()
                     # to_add["rgb"] = rgb.detach()  # .cpu()
                     # if self.renders['depth'] is not None:
                     #     to_add["depth"] = self.renders["depth"].detach()  # .cpu()
                     # else:
                     #     to_add["depth"] = None
                     # to_add["mtx"] = mtx_gu.detach()  # .cpu()
-                    self.optimization_results.append(to_add)
+                    # self.optimization_results.append(to_add)
                 else:
                     # transform quat and position into a matrix44
                     # if 'quat' in result:
@@ -2291,6 +2460,11 @@ class DiffDope:
                 with nvtx.annotate("opt.step"):
                     self.optimizer.step()
 
+                # option: (experimental) rotation-only...
+                # if True:
+                #     with th.no_grad():
+                #         self.object3d.se3[..., 3:6].fill_(0)
+
                 # option: apply T0
                 # alternatively just keep se3 as-is around the ref.point
                 if False:
@@ -2301,7 +2475,8 @@ class DiffDope:
                         self.object3d.se3.fill_(0)
                         # self.object3d.se3[..., 0:3].normal_(std=0.03)
                         # self.object3d.se3[..., 3:6].normal_(std=0.003)
-        print(loss)
+        loss.item()
+        #print(loss)
 
     def cuda(self):
         """
