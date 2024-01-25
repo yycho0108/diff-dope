@@ -67,10 +67,6 @@ SCALE = 10.0
 S_TEX = 0.5
 LOCAL: bool = True
 
-# def apply_crop(scene:Scene, camera:Camera):
-#     seg = scene.tensor_segmentation.img_tensor
-#     i0, j0, box = find_crop(seg)
-    
 
 def opencv_2_opengl(p, q):
     """
@@ -144,8 +140,6 @@ def interpolate(attr, rast, attr_idx, rast_db=None):
     )
 
 
-# @th.jit.script
-# @torch.compile
 def render_texture_batch(
     glctx,
     proj_cam,
@@ -183,40 +177,19 @@ def render_texture_batch(
     """
     if not type(resolution) == list:
         resolution = [resolution, resolution]
-    # print('pos', pos.shape)
-    # posw = torch.cat([pos, torch.ones([pos.shape[0], pos.shape[1], 1]).cuda()], axis=2)
-    # print('posw', posw.shape)
-    # posw = nn.functional.pad(pos, (0, 1), mode='constant', value=1)
-    # print(posw[..., 3]) # should be one
-    # mtx_transpose = torch.transpose(mtx, 1, 2)
-    # final_mtx_proj = th.matmul(proj_cam, mtx)
-    # pos_clip_ja = dd.xfm_points(pos.contiguous(), final_mtx_proj)
-    # pos_clip_ja = th.matmul(posw, th.transpose(final_mtx_proj, 1, 2))
-    # pos_clip_ja = th.matmul(posw, th.transpose(th.matmul(proj_cam, mtx), 1,2))
-    # p @ (c@m)^T
-    # c@m @ p
-    # print(posw.shape,
-    #       proj_cam.shape,
-    #       mtx.shape)
 
     # Potentially better to keep it
     # as einsum() to exploit torch.compile()
-    print('proj', proj_cam)
-    print('mtx', mtx)
-    print('mat?', th.einsum('nij, njk -> nik', proj_cam, mtx))
-    raise ValueError('stop')
     pos_clip_ja = th.einsum('nij, njk, n...k -> n...i',
                             proj_cam, mtx, posw)
     # pos_clip_ja = oe_expr(proj_cam, mtx, posw)
     # pos_clip_ja = oe_expr(mtx).contiguous()
 
-    # print(pos_clip_ja.shape)
-
     rast_out, rast_out_db = dr.rasterize(
         glctx, pos_clip_ja, pos_idx[0], resolution=resolution
     )
 
-    # compute the depth
+    # TODO(ycho): optionally include depth losses
     depth = None
     if False:
         gb_pos, _ = interpolate(
@@ -225,45 +198,17 @@ def render_texture_batch(
         shape_keep = gb_pos.shape
         gb_pos = gb_pos.reshape(shape_keep[0], -1, shape_keep[-1])
         gb_pos[..., 3].fill_(1)
-        # print(gb_pos.shape)
-
-        # if True:
-        #     depth0 = dd.xfm_points(gb_pos[..., :3].contiguous(), mtx)
-        #     depth0 = depth0.reshape(shape_keep)[..., 2] * -1
-
-        # if True:
-        #     depth = th.matmul(gb_pos, th.transpose(mtx, 1, 2))
-        #     depth = depth.reshape(shape_keep)[..., 2] * -1
-        #     depth1 = depth
-
-        # depth = mtx @ gb_pos
-        # == basically mtx[:3,:3] @ gb_pos + mtx[:3, 3]
-        # depth = gb_pos[...,
-        # print(gb_pos.shape)
-        # print(mtx[..., 2, :3].shape)
-        # depth = mtx[..., 2, :3].dot(gb_pos[..., :3]) + mtx[2,3]
-        # depth = th.einsum('ni, npi -> np', mtx[..., 2], gb_pos) + mtx[..., 2,3]
         depth = th.matmul(gb_pos, mtx[..., 2, :, None]).squeeze(dim=-1)
         depth = -depth.reshape(shape_keep[:-1])
-        # print(depth[depth != 0].mean())
-        # print((depth - depth1).std())
-        # print((depth - depth0).std())
-        # print(depth.shape)
 
-    # mask   , _ = dr.interpolate(torch.ones(pos_idx.shape).cuda(), rast_out, pos_idx)
+    # TODO(ycho): optionally include mask losses
     mask = None
     if False:
         mask, _ = dr.interpolate(
-                th.ones(pos_idx.shape[:-1] + (1,),
-                        device=pos_idx.device),
-                # th.ones_like(pos_idx[..., :1], dtype=th.float32,
-                #              device=pos_idx.device),
-                rast_out, pos_idx[0], rast_db=rast_out_db, diff_attrs="all"
-        )
-        # print('mask', mask.shape)
-        # needed?
+            # torch.ones(pos_idx.shape).cuda(),
+            th.ones(pos_idx.shape, device='cuda'),
+            rast_out, pos_idx[0], rast_db=rast_out_db, diff_attrs="all")
         mask = dr.antialias(mask, rast_out, pos_clip_ja, pos_idx[0])
-        # print('.mask', mask.shape)
 
     # compute vertex color interpolation
     if vtx_color is None:
@@ -276,15 +221,11 @@ def render_texture_batch(
             texd,
             filter_mode="linear",
         )
-        # color = color * (rast_out[..., -1:] > 0)  # Mask out background.
     else:
         color, _ = dr.interpolate(vtx_color, rast_out, pos_idx[0])
-        # color = color * (rast_out[..., -1:] > 0)  # Mask out background.
-    # if not return_rast_out:
-    #     rast_out = None
     return {"rgb": color, "depth": depth, "rast_out": rast_out, 'mask': mask}
 
-# @torch.compile()
+@torch.compile()
 def loss_fn(
         gt_tensors:Dict[str, th.Tensor],
         proj_cam:th.Tensor,
@@ -302,14 +243,11 @@ def loss_fn(
         tex:th.Tensor,
         learning_rates:th.Tensor,
         weight_rgb:float,
-        weight_depth:float,
-        weight_mask:float,
         resolution:Tuple[int,int],
         # oe_expr,
         glctx
     ):
     mtx_gu = T0 @ SE3Exp(u_se3 * scale, g)
-    # mtx_gu = SE3Exp(u_se3 * scale, g) @ T0
     renders = render_texture_batch(
                             glctx=glctx,
                             proj_cam=proj_cam,
@@ -320,484 +258,44 @@ def loss_fn(
                             uv_idx=uv_idx,
                             tex=tex,
                             resolution=resolution)
-    has_data = (renders['rast_out'][..., -1:] > 0)
-    loss, berr = l1_rgb_with_mask_t(
+    return l1_rgb_with_mask_t(
                 # ddope.renders['rgb'][..., :3],
                 renders['rgb'],
                 gt_tensors['rgb'][..., :3],
-                # renders['rast_out'][..., -1:],
-                has_data,
+                renders['rast_out'][..., -1:],
                 gt_tensors["segmentation"],
                 learning_rates,
-                weight_rgb,
-                #pred_mask = renders['mask'],
-                )
-    #loss = loss + l1_depth_with_mask_t(
-    #        renders['depth'],
-    #        gt_tensors['depth'],
-    #        gt_tensors['segmentation'],
-    #        learning_rates,
-    #        weight_depth,
-    #        # pred_mask = renders['mask'],
-    #        #pred_mask=has_data,
-    #        )
-    
-    # loss = loss + l1_mask_t(
-    #         renders['mask'],
-    #         gt_tensors['segmentation'],
-    #         learning_rates,
-    #         weight_mask)
-
-    # aux = dict(renders)
-    # aux['mtx'] = mtx_gu
-
-    # renders['mtx'] = mtx_gu
-    return (loss, berr), None
-
-##############################################################################
-# IMG MANIPULATION
-##############################################################################
-
-
-@torch.no_grad()
-def find_crop(img_tensor, percentage=0.1):
-    """
-    Find the bounding crop in an image, assuming it finds where there is non-zero.
-
-    Args:
-        img_tensor: Input image tensor
-
-    Returns:
-        list: [top_row, left_col, size]
-    """
-
-    img_tensor = (img_tensor > 0).float()
-
-    # Find the bounding box of the img_tensor
-    rows, cols = torch.nonzero(img_tensor[..., 0], as_tuple=True)
-    top_row, left_col = rows.min(), cols.min()
-    bottom_row, right_col = rows.max(), cols.max()
-
-    # Calculate the wiggle room for each dimension (percentage of the
-    # width/height)
-    wiggle_room_rows = int((bottom_row - top_row + 1) * percentage)
-    wiggle_room_cols = int((right_col - left_col + 1) * percentage)
-
-    # Expand the bounding box by the wiggle room
-    top_row = max(0, top_row - wiggle_room_rows)
-    left_col = max(0, left_col - wiggle_room_cols)
-    bottom_row = min(img_tensor.shape[0] - 1, bottom_row + wiggle_room_rows)
-    right_col = min(img_tensor.shape[1] - 1, right_col + wiggle_room_cols)
-
-    # Calculate the size of the square crop as the minimum of the expanded
-    # height and width
-    crop_size = max(bottom_row - top_row, right_col - left_col)
-
-    return [top_row, left_col, crop_size]
-
-@torch.no_grad()
-def find_crop_2(img_tensor, percentage=0.1):
-    """
-    Find the bounding crop in an image, assuming it finds where there is non-zero.
-
-    Args:
-        img_tensor: Input image tensor
-
-    Returns:
-        list: [top_row, left_col, size]
-    """
-
-    img_tensor = (img_tensor > 0).float()
-
-    # Find the bounding box of the img_tensor
-    rows, cols = torch.nonzero(img_tensor[..., 0], as_tuple=True)
-    top_row, left_col = rows.min(), cols.min()
-    bottom_row, right_col = rows.max(), cols.max()
-
-    # Calculate the wiggle room for each dimension (percentage of the
-    # width/height)
-    wiggle_room_rows = int((bottom_row - top_row + 1) * percentage)
-    wiggle_room_cols = int((right_col - left_col + 1) * percentage)
-
-    # Expand the bounding box by the wiggle room
-    top_row = max(0, top_row - wiggle_room_rows)
-    left_col = max(0, left_col - wiggle_room_cols)
-    bottom_row = min(img_tensor.shape[0] - 1, bottom_row + wiggle_room_rows)
-    right_col = min(img_tensor.shape[1] - 1, right_col + wiggle_room_cols)
-
-    # Calculate the size of the square crop as the minimum of the expanded
-    # height and width
-    crop_size = max(bottom_row - top_row, right_col - left_col)
-
-    return [top_row, left_col, bottom_row - top_row, right_col - left_col]
-
-#@torch.no_grad()
-def apply_crop_np(x: np.ndarray, crop:Tuple[float,float,float]):
-    i0, j0, di,dj = [int(x) for x in crop]
-    print(i0, j0, di, dj)
-    return x[i0:i0+di+1, j0:j0+dj+1]
-
-# def getimg_stack(color_imgs, depth=False, depth_max=3, w=1, h=1):
-#     if depth:
-#         for i_im in range(len(color_imgs)):
-#             color_imgs[i_im] = torch.cat(
-#                 [
-#                     color_imgs[i_im].unsqueeze(-1),
-#                     color_imgs[i_im].unsqueeze(-1),
-#                     color_imgs[i_im].unsqueeze(-1),
-#                 ],
-#                 dim=-1,
-#             )
-
-#             color_imgs[i_im][color_imgs[i_im] < 0] = depth_max
-
-#             color_imgs[i_im] /= depth_max
-#             # print(color_imgs[i_im].shape)
-
-#     col_imgs = []
-#     for ei in range(h):
-#         row_imgs = []
-#         for jj in range(w):
-#             if ii + jj < len(color_imgs):
-#                 img_ref = color_imgs[ii + jj][0].detach().cpu().numpy()
-#             else:
-#                 img_ref = np.zeros(color_imgs[-1][0].shape)
-#             row_imgs.append(img_ref)
-
-#         row_all = np.concatenate(row_imgs, axis=1)[::-1]
-#         # print(row_all.shape)
-#         col_imgs.append(row_all)
-#     gt_final = np.concatenate(col_imgs, axis=0)
-#     # return cv2.resize(gt_final,(400,400))
-#     return gt_final
-
-
-@torch.no_grad()
-def im_resize(image, width=None, height=None):
-    dim = None
-    (h, w) = image.shape[:2]
-
-    # check to see if the width is None
-    if width is None:
-        # calculate the ratio of the height and construct the
-        # dimensions
-        r = height / float(h)
-        dim = (int(w * r), height)
-
-    # otherwise, the height is None
-    elif height is None:
-        # calculate the ratio of the width and construct the
-        # dimensions
-        r = width / float(w)
-        dim = (width, int(h * r))
-
-    # resize the image
-    resized = cv2.resize(image, dim)
-    return resized
-
-
-@torch.no_grad()
-def make_grid(
-    tensor: Union[torch.Tensor, List[torch.Tensor]],
-    nrow: int = 8,
-    padding: int = 2,
-    normalize: bool = False,
-    value_range: Optional[Tuple[int, int]] = None,
-    scale_each: bool = False,
-    pad_value: float = 0.0,
-) -> torch.Tensor:
-    """
-    Make a grid of images.
-    taken from https://github.com/pytorch/vision/blob/main/torchvision/utils.py
-
-    Args:
-        tensor (Tensor or list): 4D mini-batch Tensor of shape (B x C x H x W)
-            or a list of images all of the same size.
-        nrow (int, optional): Number of images displayed in each row of the grid.
-            The final grid size is ``(B / nrow, nrow)``. Default: ``8``.
-        padding (int, optional): amount of padding. Default: ``2``.
-        normalize (bool, optional): If True, shift the image to the range (0, 1),
-            by the min and max values specified by ``value_range``. Default: ``False``.
-        value_range (tuple, optional): tuple (min, max) where min and max are numbers,
-            then these numbers are used to normalize the image. By default, min and max
-            are computed from the tensor.
-        scale_each (bool, optional): If ``True``, scale each image in the batch of
-            images separately rather than the (min, max) over all images. Default: ``False``.
-        pad_value (float, optional): Value for the padded pixels. Default: ``0``.
-
-    Returns:
-        grid (Tensor): the tensor containing grid of images.
-    """
-    if not torch.is_tensor(tensor):
-        if isinstance(tensor, list):
-            for t in tensor:
-                if not torch.is_tensor(t):
-                    raise TypeError(
-                        f"tensor or list of tensors expected, got a list containing {type(t)}"
-                    )
-        else:
-            raise TypeError(
-                f"tensor or list of tensors expected, got {type(tensor)}")
-
-    # if list of tensors, convert to a 4D mini-batch Tensor
-    if isinstance(tensor, list):
-        tensor = torch.stack(tensor, dim=0)
-
-    if tensor.dim() == 2:  # single image H x W
-        tensor = tensor.unsqueeze(0)
-    if tensor.dim() == 3:  # single image
-        if tensor.size(0) == 1:  # if single-channel, convert to 3-channel
-            tensor = torch.cat((tensor, tensor, tensor), 0)
-        tensor = tensor.unsqueeze(0)
-
-    if tensor.dim() == 4 and tensor.size(1) == 1:  # single-channel images
-        tensor = torch.cat((tensor, tensor, tensor), 1)
-
-    if normalize is True:
-        tensor = tensor.clone()  # avoid modifying tensor in-place
-        if value_range is not None and not isinstance(value_range, tuple):
-            raise TypeError(
-                "value_range has to be a tuple (min, max) if specified. min and max are numbers"
-            )
-
-        def norm_ip(img, low, high):
-            img.clamp_(min=low, max=high)
-            img.sub_(low).div_(max(high - low, 1e-5))
-
-        def norm_range(t, value_range):
-            if value_range is not None:
-                norm_ip(t, value_range[0], value_range[1])
-            else:
-                norm_ip(t, float(t.min()), float(t.max()))
-
-        if scale_each is True:
-            for t in tensor:  # loop over mini-batch dimension
-                norm_range(t, value_range)
-        else:
-            norm_range(tensor, value_range)
-
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError("tensor should be of type torch.Tensor")
-    if tensor.size(0) == 1:
-        return tensor.squeeze(0)
-
-    # make the mini-batch of images into a grid
-    nmaps = tensor.size(0)
-    xmaps = min(nrow, nmaps)
-    ymaps = int(math.ceil(float(nmaps) / xmaps))
-    height, width = int(tensor.size(
-        2) + padding), int(tensor.size(3) + padding)
-    num_channels = tensor.size(1)
-    grid = tensor.new_full(
-        (num_channels,
-         height * ymaps + padding,
-         width * xmaps + padding),
-        pad_value)
-    k = 0
-    for y in range(ymaps):
-        for x in range(xmaps):
-            if k >= nmaps:
-                break
-            # Tensor.copy_() is a valid method but seems to be missing from the stubs
-            # https://pytorch.org/docs/stable/tensors.html#torch.Tensor.copy_
-            grid.narrow(1, y * height + padding, height - padding).narrow(  # type: ignore[attr-defined]
-                2, x * width + padding, width - padding
-            ).copy_(
-                tensor[k]
-            )
-            k = k + 1
-    return grid
-
-
-@torch.no_grad()
-def make_grid_image(img_batch, row, final_width, depth=False):
-    img_batch = make_grid(img_batch.permute(0, 3, 1, 2), nrow=row)
-    img_batch = (
-        img_batch.mul(255)
-        .clamp_(0, 255)
-        .permute(1, 2, 0)
-        .to("cpu", torch.uint8)
-        .numpy()
-    )
-    img_batch = cv2.cvtColor(img_batch, cv2.COLOR_BGR2RGB)
-    if depth is True:
-        img_batch = cv2.applyColorMap(
-            (img_batch).astype(np.uint8),
-            cv2.COLORMAP_JET)
-    img_batch = im_resize(img_batch, width=final_width)
-
-    return img_batch
-
-
-@torch.no_grad()
-def make_grid_overlay_batch(
-    foreground,
-    background=None,
-    alpha=0.5,
-    row=2,
-    final_width=2000,
-    add_background=True,
-    add_contour=True,
-    color_countour=[1, 0, 0],
-    flip_result=True,
-):
-    """
-    Make a grid image of a batch
-
-    Args:
-        foreground (torch.tensor): BxWxHx3 normalized foreground image
-        background (torch.tensor): BxWxHx3 normalized background image, if None then don't add
-        alpha (float): alpha of the nvdiffrast render
-        row (int): how entry in a row you want for the grid
-        final_width (int): final width in pixel of the grid image
-        add_background (bool): Add the background or not
-        add_contour (bool): Add the foreground contour or not
-        color_countour (list(float)): color in normalized space
-        flip_result (bool): Flip the final image
-
-    Returns:
-        A grid cv2 image (nd.array): WxHx3
-    """
-
-    # assumes a 3 channel image and normalized
-    foreground = make_grid_image(foreground, row, final_width)
-
-    if add_contour:
-        alpha_img = np.zeros(foreground.shape[:2])
-
-        gray = cv2.cvtColor(foreground, cv2.COLOR_BGR2GRAY)
-        gray = gray.astype(np.uint8)
-        alpha_img[gray > 0] = alpha
-
-        cnts = cv2.findContours(
-            gray,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE)
-        cnts = cnts[0] if len(cnts) == 2 else cnts[1]
-
-    if not background is None and add_background:
-        background = make_grid_image(background, row, final_width)
-    else:
-        # make a black image
-        background = np.zeros(foreground.shape)
-
-    blended_image = cv2.merge(
-        (alpha_img * foreground[:, :, 0] + (1 - alpha_img) *
-         background[:, :, 0],
-         alpha_img * foreground[:, :, 1] + (1 - alpha_img) *
-         background[:, :, 1],
-         alpha_img * foreground[:, :, 2] + (1 - alpha_img) *
-         background[:, :, 2],)).astype("uint8")
-
-    if add_contour:
-        for c in cnts:
-            cv2.drawContours(
-                blended_image, [c], -1, (36, 255, 12), thickness=1, lineType=cv2.LINE_AA)
-    if flip_result:
-        blended_image = cv2.flip(blended_image, 0)
-
-    return blended_image
-
+                weight_rgb), mtx_gu, renders['rgb']
 
 ##############################################################################
 # LOSSES
 ##############################################################################
-def dist_batch_lr(x:th.Tensor,
-                  learning_rates:th.Tensor,
-                  # channels:Tuple[int,int,int]=( 1, 2, 3 )
-                  ) -> th.Tensor:
-    """
-    Method that distribute different learning rates to the batch.
-
-    Args:
-        tensor (torch.tensor): BxWxHxC if you do not have C, pass a different set of channel, for example you could run on a depth map [1,2].
-        learning_rates (torch.tensor): B the different learning rates needed.
-        channels (list): the index values used to apply the first mean, e.g., [1,2,3] for colored image, or [1,2] for a depth map
-    """
-    # return torch.mean(tensor, channels) * learning_rates
-    return x.reshape(x.shape[0], -1).mean(dim=-1) * learning_rates
-
-# @th.jit.script
-# @torch.compile
 def l1_rgb_with_mask_t(pred_rgb:th.Tensor,
                        true_rgb:th.Tensor,
                        pred_mask: th.Tensor,
                        true_mask:th.Tensor,
                        learning_rates:th.Tensor,
-                       weight_rgb:float,
-                       ) -> th.Tensor:
-
-    #if pred_mask is not None:
-    #    diff_rgb = torch.abs(
-    #        (pred_rgb * (pred_mask>0) - true_rgb) * (
-    #            true_mask[..., 0] + pred_mask[...,0]
-    #            )
-    #    )
-    #else:
-
-    # diff_rgb = torch.abs((pred_rgb * (pred_mask) - true_rgb) * (true_mask + pred_mask))
-    diff_rgb = torch.abs((pred_rgb * (pred_mask) - true_rgb) * (true_mask))
-
+                       weight_rgb:float) -> th.Tensor:
+    diff_rgb = torch.abs((pred_rgb * (pred_mask>0) - true_rgb) * (true_mask))
     # lr_diff_rgb = dist_batch_lr(diff_rgb, learning_rates)
     batch_err = diff_rgb.reshape(diff_rgb.shape[0], -1).mean(dim=-1)
     lr_diff_rgb = batch_err * learning_rates
-    # return lr_diff_rgb.mean() * weight_rgb, batch_err
-    return lr_diff_rgb.mean() * weight_rgb, None
+    return lr_diff_rgb.mean() * weight_rgb, batch_err
 
 
-def l1_rgb_with_mask(ddope, log:bool = False):
+def l1_rgb_with_mask(ddope):
     """
     Computes the l1_rgb on a DiffDOPE object, simpler to pass the object.
     """
-    if not log:
-        return l1_rgb_with_mask_t(
-                # ddope.renders['rgb'][..., :3],
-                ddope.renders['rgb'],
-                ddope.gt_tensors['rgb'][..., :3],
-                ddope.renders['rast_out'][..., -1:],
-                ddope.gt_tensors["segmentation"],
-                ddope.learning_rates,
-                ddope.cfg.losses.weight_rgb)
-    diff_rgb = torch.abs(
-        (ddope.renders["rgb"][..., :3] - ddope.gt_tensors["rgb"][..., :3])
-        * (ddope.gt_tensors["segmentation"]
-           # * (ddope.renders["rast_out"][..., -1:] > 0 )
-           )
-    )
-    lr_diff_rgb = dist_batch_lr(diff_rgb, ddope.learning_rates)
-    ddope.add_loss_value(
-        "rgb", torch.mean(
-            diff_rgb.detach(), (1, 2, 3)) * ddope.cfg.losses.weight_rgb)
-    return lr_diff_rgb.mean() * ddope.cfg.losses.weight_rgb
+    return l1_rgb_with_mask_t(
+            # ddope.renders['rgb'][..., :3],
+            ddope.renders['rgb'],
+            ddope.gt_tensors['rgb'][..., :3],
+            ddope.renders['rast_out'][..., -1:],
+            ddope.gt_tensors["segmentation"],
+            ddope.learning_rates,
+            ddope.cfg.losses.weight_rgb)
 
-
-def l1_depth_with_mask_t(
-        pred_depth:th.Tensor,
-        true_depth:th.Tensor,
-        true_mask:th.Tensor,
-        learning_rates:th.Tensor,
-        weight_depth:float,
-        pred_mask:Optional[th.Tensor]=None):
-    """
-    Computes the l1_depth on a DiffDOPE object, simpler to pass the object.
-    """
-
-    if pred_mask is not None:
-        diff_depth = torch.abs(
-            (pred_depth - true_depth) * (
-                true_mask[..., 0] + pred_mask[...,0].detach())
-        )
-    else:
-        diff_depth = torch.abs(
-            (pred_depth - true_depth) * true_mask[..., 0]
-        )
-    # lr_diff_depth = dist_batch_lr(diff_depth, ddope.learning_rates, [1, 2])
-    batch_err = diff_depth.reshape(diff_depth.shape[0], -1).mean(dim=-1)
-    lr_diff_depth = batch_err * learning_rates
-    # ddope.add_loss_value(
-    #     "depth", torch.mean(
-    #         diff_depth.detach(), (1, 2)) * ddope.cfg.losses.weight_depth)
-    return lr_diff_depth.mean() * weight_depth
 
 def l1_depth_with_mask(ddope):
     """
@@ -816,15 +314,6 @@ def l1_depth_with_mask(ddope):
 
     return lr_diff_depth.mean() * ddope.cfg.losses.weight_depth
 
-def l1_mask_t(pred_mask:th.Tensor,
-              true_mask:th.Tensor,
-              learning_rates:th.Tensor,
-              weight_mask:float):
-    # print(pred_mask.shape, true_mask.shape)
-    diff_mask = torch.abs( (pred_mask[...,0] - true_mask[...,0]))
-    batch_err = diff_mask.reshape(diff_mask.shape[0], -1).mean(dim=-1)
-    lr_diff_mask = batch_err * learning_rates
-    return lr_diff_mask.mean() * weight_mask
 
 def l1_mask(ddope):
     """
@@ -841,7 +330,7 @@ def l1_mask(ddope):
     ddope.optimization_results[-1]["mask"] = mask.detach()  # .cpu()
 
     # Compute the difference between the mask and ground truth segmentation
-    diff_mask = torch.abs(mask - ddope.gt_tensors["segmentation"][...,0])
+    diff_mask = torch.abs(mask - ddope.gt_tensors["segmentation"])
 
     # Compute the L1-on mask loss with batch-wise learning rates
     lr_diff_mask = dist_batch_lr(diff_mask, ddope.learning_rates)
@@ -891,16 +380,7 @@ class Camera:
     znear: Optional[float] = 0.01
     zfar: Optional[float] = 200
 
-    box_width:Optional[int] = None
-    box_height:Optional[int] = None
-    x0:int=0
-    y0:int=0
-
     def __post_init__(self):
-        if self.box_width is None:
-            self.box_width = self.im_width
-        if self.box_height is None:
-            self.box_height = self.im_height
         self.cam_proj = self.get_projection_matrix()
 
     def set_batchsize(self, batchsize):
@@ -918,39 +398,6 @@ class Camera:
     def cuda(self):
         self.cam_proj = self.cam_proj.cuda().float()
 
-    def crop(self, param):
-        i0, j0, di, dj = [int(x) for x in param]
-        # self.cx -= i0
-        # self.cy -= j0
-        # self.cx += i0
-        # self.cy += j0
-        self.cx = self.cx - j0
-        self.cy = self.cy - i0
-        # self.x0 = self.x0 - j0
-        # self.y0 = self.y0 - i0
-
-
-        # JUST because of the K[0,0]/w logic
-        # we need to premultiply fx/fy
-        # by
-        # fx'/s == fx/true_width
-        # fx' = fx*s/true_width
-        # self.fx *= s / self.im_width
-        # self.fy *= s / self.im_height
-
-        self.box_width = dj
-        self.box_height = di
-        # self.cx += j0
-        # self.cy += i0
-
-        # NOTE(ycho): technically 
-        # self.im_width = self.im_height = s,
-        # but get_projection_matrix()
-        # computes projection mat. params
-        # based on the original shape
-        # so I think we should leave this as-is
-        self.cam_proj = self.get_projection_matrix()
-
     def resize(self, percentage):
         """
         If you resize the images for the optimization
@@ -958,20 +405,12 @@ class Camera:
         Args:
             percentage (float): bounded between [0,1]
         """
-        # raise ValueError("!")
-        # print('percentage', percentage)
         self.fx *= percentage
         self.fy *= percentage
-        self.cx = percentage * self.cx
-        self.cy = percentage * self.cy
-        self.x0 *= percentage
-        self.y0 *= percentage
-        self.im_width = percentage * self.im_width
-        self.im_height = percentage * self.im_height
-        self.box_width = percentage * self.box_width
-        self.box_height = percentage * self.box_height
-        # print('>>>>>>>>>>>>>>RESZ')
-        self.cam_proj = self.get_projection_matrix()
+        self.cx = (int)(percentage * self.cx)
+        self.cy = (int)(percentage * self.cy)
+        self.im_width = (int)(percentage * self.im_width)
+        self.im_height = (int)(percentage * self.im_height)
 
     def get_projection_matrix(self):
         """
@@ -986,22 +425,14 @@ class Camera:
         Returns:
             torch.tensor: a 4x4 projection matrix in OpenGL coordinate frame
         """
-        print('>>>>>>>>>>>>>>PROJ')
+
         K = np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1]])
-        # print('K', K)
-        x0 = self.x0
-        y0 = self.y0
+        x0 = 0
+        y0 = 0
         w = self.im_width
         h = self.im_height
-        print(x0, y0, w, h)
-        bw = self.box_width
-        bh = self.box_height
         nc = self.znear
         fc = self.zfar
-
-        print(w, h,
-              self.fx,self. fy,self. cx,self. cy,
-              nc, fc)
 
         window_coords = "y_down"
 
@@ -1012,58 +443,38 @@ class Camera:
         # Draw our images upside down, so that all the pixel-based coordinate
         # systems are the same.
         if window_coords == "y_up":
-            # proj = np.array(
-            #     [
-            #         [
-            #             2 * K[0, 0] / w,
-            #             -2 * K[0, 1] / w,
-            #             (-2 * K[0, 2] + w + 2 * x0) / w,
-            #             0,
-            #         ],
-            #         [0,
-            #          -2 * K[1, 1] / h,
-            #          (-2 * K[1, 2] + h + 2 * y0) / h,
-            #          0],
-            #         [0, 0, q, qn],  # Sets near and far planes (glPerspective).
-            #         [0, 0, -1, 0],
-            #     ]
-            # )
-            pass
-
-        # 2 * K[0,0] / w == (rightmost + leftmost) / (rightmost - leftmost)
-
-        # -2 * K[0,2] + w + 2 * x0 / w == (right+left) / (right-left)
-        # -2 * cx + w + 2 * x0 / w
-
-        # "left" = x0
-        # "right" = x0 + w
-        # "center(?)" = -2*cx << wat is dis
+            proj = np.array(
+                [
+                    [
+                        2 * K[0, 0] / w,
+                        -2 * K[0, 1] / w,
+                        (-2 * K[0, 2] + w + 2 * x0) / w,
+                        0,
+                    ],
+                    [0, -2 * K[1, 1] / h, (-2 * K[1, 2] + h + 2 * y0) / h, 0],
+                    [0, 0, q, qn],  # Sets near and far planes (glPerspective).
+                    [0, 0, -1, 0],
+                ]
+            )
 
         # Draw the images upright and modify the projection matrix so that OpenGL
         # will generate window coords that compensate for the flipped image
         # coords.
         else:
-            # proj(K, x) == proj(K', x) - (i0, j0)
             assert window_coords == "y_down"
-            # print((-2 * K[0, 2] + w + 2 * x0) / w)
             proj = np.array(
                 [
                     [
-                        2 * K[0, 0] / bw, 
-                        # -2 * K[0, 1] / bw,
-                        0,
-                        (-2 * K[0, 2] + bw + 2 * x0) / bw,
+                        2 * K[0, 0] / w,
+                        -2 * K[0, 1] / w,
+                        (-2 * K[0, 2] + w + 2 * x0) / w,
                         0,
                     ],
-                    [0,
-                     2 * K[1, 1] / bh,
-                     (2 * K[1, 2] - bh - 2 * y0) / bh,
-                     0],
+                    [0, 2 * K[1, 1] / h, (2 * K[1, 2] - h + 2 * y0) / h, 0],
                     [0, 0, q, qn],  # Sets near and far planes (glPerspective).
                     [0, 0, -1, 0],
                 ]
             )
-        print('proj', proj)
 
         return torch.tensor(proj)
 
@@ -1412,7 +823,7 @@ class Object3D(torch.nn.Module):
                     br6.clone(), requires_grad=True))
             with th.no_grad():
                 # for testing... (or for testing with perturbations...)
-                # self.r6 += 0.5 * th.randn_like(self.r6)
+                # self.r6 += 0.3 * th.randn_like(self.r6)
                 self.r6 /= SCALE
         elif RTYPE == 'quat':
             self.qx = torch.nn.Parameter(
@@ -1449,7 +860,6 @@ class Object3D(torch.nn.Module):
                     self.T0[..., 2, 3] = self._position[2]
                     # homogeneous
                     self.T0[..., 3, 3] = 1
-                print('ultimately, T0', self.T0)
             if LOCAL:
                 print('make se3')
                 self.register_parameter(
@@ -1464,11 +874,6 @@ class Object3D(torch.nn.Module):
                     self.se3[..., 3] = 0
                     self.se3[..., 4] = 0
                     self.se3[..., 5] = 0
-                    if False:
-                        # rot; std around 6 deg.
-                        self.se3[..., 0:3].normal_(0.0, 0.1 / SCALE)
-                        # trans
-                        self.se3[..., 3:6].normal_(0.0, 0.01)
             else:
                 # global
                 self.register_parameter(
@@ -1629,7 +1034,6 @@ class Image:
     img_path: Optional[str] = None
     img_tensor: Optional[torch.tensor] = None
     img_resize: Optional[float] = 1
-    img_crop: Optional[Tuple[float,float,float,float]] = None
     flip_img: Optional[bool] = True
     depth: Optional[bool] = False
     depth_scale: Optional[float] = 100
@@ -1644,16 +1048,10 @@ class Image:
                 im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
                 # normalize
                 im = im / 255.0
-
-            if self.img_crop is not None:
-                im = apply_crop_np(im, self.img_crop)
-                print('im(crop)', im.shape)
-
             if self.flip_img:
                 im = cv2.flip(im, 0)
-                print('im(flip)', im.shape)
 
-            if True:#self.img_resize < 1.0:
+            if self.img_resize < 1.0:
                 if self.depth:
                     im = cv2.resize(
                         im,
@@ -1725,84 +1123,19 @@ class Scene:
     tensor_depth: Optional[Image] = None
     tensor_segmentation: Optional[Image] = None
 
-    crop: Optional[Tuple[float,float,float,float]] = None
-
     def __post_init__(self):
         # load the images and store them correctly
-        CROP:bool = True
-        crop = None
-        if not self.path_segmentation is None:
-            print('load(seg)')
-            self.tensor_segmentation = Image(
-                self.path_segmentation,
-                img_resize=self.image_resize
-            )
-            if CROP:
-                # ===> crop( resize(flip(x)) )
-
-                # Some padding seems useful to avoid degeneracies
-                # (like the object flying away)
-                crop = find_crop_2(self.tensor_segmentation.img_tensor,
-                                   percentage = 0.25)
-                # crop = (0, 20, 60, 60)
-                print('crop', crop)
-
-                # since the crop has been found _after_
-                # resize() and flip() ...
-                # currently it looks like crop(resize(flip()))
-
-                # undo resize()
-                if self.image_resize is not None:
-                    crop = [x / self.image_resize for x in crop] 
-                h = (
-                        self.tensor_segmentation.img_tensor.shape[0]
-                        / self.image_resize)
-                print('h', h)
-                print(h, crop[0], crop[2])
-                # crop is given in "unflipped" version
-                crop = [h-crop[0]-crop[2],
-                        crop[1],
-                        crop[2],
-                        crop[3]] # undo flip()
-                print('crop', crop)
-                # reload with crop pre-applied;
-                # so that we can load resize(crop(flip()))
-                # instead of the other way around,
-                # i.e. crop(resize(flip())).
-                print('load_2(seg)')
-
-                # Overwrite image_resize() based on the
-                # newfound(?) dimensions
-                #self.image_resize = (
-                #        self.tensor_segmentation.img_tensor.shape[0] / crop[2]
-                #)
-                self.image_resize = min(1.0,
-                                        self.tensor_segmentation.img_tensor.shape[0] / crop[2]
-                                        )
-                # self.image_resize = 1.0 # hmm
-                self.tensor_segmentation = Image(
-                    self.path_segmentation,
-                    img_resize=self.image_resize,
-                    img_crop = crop
-                )
         if not self.path_img is None:
-            print('load(rgb)')
             self.tensor_rgb = Image(
-                self.path_img,
-                img_resize=self.image_resize,
-                img_crop =crop
-                )
+                self.path_img, img_resize=self.image_resize)
         if not self.path_depth is None:
-            print('load(depth)')
             self.tensor_depth = Image(
-                self.path_depth,
-                img_resize=self.image_resize,
-                depth=True,
-                img_crop = crop
+                self.path_depth, img_resize=self.image_resize, depth=True
             )
-
-        if CROP:
-            self.crop = crop
+        if not self.path_segmentation is None:
+            self.tensor_segmentation = Image(
+                self.path_segmentation, img_resize=self.image_resize
+            )
 
     def set_batchsize(self, batchsize):
         """
@@ -1888,34 +1221,14 @@ class DiffDope:
     # driven by the cfg
 
     def __post_init__(self):
+        if self.camera is None:
+            # load the camera from the config
+            self.camera = Camera(**self.cfg.camera)
+        # print(self.pose.position)
         if self.object3d is None:
             self.object3d = Object3D(**self.cfg.object3d)
         if self.scene is None:
             self.scene = Scene(**self.cfg.scene)
-        if self.camera is None:
-            # load the camera from the config
-            self.camera = Camera(**self.cfg.camera,
-                                 # resize = self.scene.image_resize,
-                                 # crop = self.scene.crop
-                                 )
-            # if self.scene.crop is not None:
-            #     self.camera.crop(self.scene.crop)
-            # if self.scene.resize is not None:
-            #     self.camera.resize(self.scene.crop)
-            print('ORIGINAL')
-            self.camera.get_projection_matrix()
-
-            print('CROP')
-            if self.scene.crop is not None:
-                self.camera.crop(self.scene.crop)
-
-            print('RESIZE')
-            if self.scene.image_resize is not None:
-               self.camera.resize(self.scene.image_resize)
-
-        # print(self.pose.position)
-        # if True:
-        #     self.scene, self.camera = apply_crop(self.scene, self.camera)
         self.batchsize = self.cfg.hyperparameters.batchsize
 
         # load the rendering
@@ -1986,124 +1299,6 @@ class DiffDope:
         ]
         self.learning_rates = torch.tensor(self.learning_rates).float().cuda()
 
-    def render_img(
-        self,
-        index=None,
-        batch_index=None,
-        render_selection="rgb",
-    ):
-        """
-        Rendering an image with the render overlay on the image or not.
-            Check config `render_images` entry for hyper params for this function.
-
-        Parameters:
-            nrow (int): grid row width
-            final_width_batch (int): grid final width in pixel
-            add_background (bool): do you want to have the image we optimize as
-                background?
-            alpha_overlay (float): The transparency applied to the rendered 3d model
-                so you can see how it overlays
-            crop_around_mask (bool): Crop around the provided mask, if no mask then uses the render to crop, but crop will be moving
-
-        Args:
-            index (int): None, which index of the optimization you want to render
-                if None, renders the last one
-            batch_index (int): None, which batch indez you want to render as image
-                If None, renders all the images in the batch.
-            render_selection (str): 'rgb','depth',
-
-        Returns:
-            An image in the form of a nd.array (cv2 style)
-        """
-
-        # TODO
-        # check if there is an argmin and render that one instead of none.
-
-        if index is None:
-            index = -1
-        else:
-            assert index < len(self.optimization_results) and index >= 0
-
-        if self.cfg.render_images.crop_around_mask:
-            if "segmentation" in self.gt_tensors.keys():
-                crop = find_crop(self.gt_tensors["segmentation"][0])
-
-            else:
-                crop = find_crop(
-                    self.optimization_results[index][render_selection][0])
-
-        if batch_index is None:
-            # make a grid
-            if self.cfg.render_images.crop_around_mask:
-                gt_tensor = self.gt_tensors[render_selection][
-                    :,
-                    crop[0]: crop[0] + crop[2] + 1,
-                    crop[1]: crop[1] + crop[2] + 1,
-                    ...,
-                ]
-                gu_tensor = self.optimization_results[index][render_selection][
-                    :,
-                    crop[0]: crop[0] + crop[2] + 1,
-                    crop[1]: crop[1] + crop[2] + 1,
-                    ...,
-                ]
-            else:
-                gt_tensor = self.gt_tensors[render_selection]
-                gu_tensor = self.optimization_results[index][render_selection]
-
-            img = make_grid_overlay_batch(
-                background=gt_tensor,
-                foreground=gu_tensor,
-                alpha=self.cfg.render_images.alpha_overlay,
-                row=self.cfg.render_images.nrow,
-                final_width=self.cfg.render_images.final_width_batch,
-                add_background=self.cfg.render_images.add_background,
-                add_contour=self.cfg.render_images.add_countour,
-                color_countour=self.cfg.render_images.color_countour,
-                flip_result=self.cfg.render_images.flip_result,
-            )
-
-            return img
-        else:
-            k_gt = render_selection
-            if render_selection == 'mask':
-                k_gt = 'segmentation'
-                
-            if self.cfg.render_images.crop_around_mask:
-                gt_tensor = self.gt_tensors[k_gt][
-                    batch_index,
-                    crop[0]: crop[0] + crop[2] + 1,
-                    crop[1]: crop[1] + crop[2] + 1,
-                    ...,
-                ]
-                gu_tensor = self.optimization_results[index][render_selection][
-                    batch_index,
-                    crop[0]: crop[0] + crop[2] + 1,
-                    crop[1]: crop[1] + crop[2] + 1,
-                    ...,
-                ]
-            else:
-                gt_tensor = self.gt_tensors[k_gt][batch_index]
-                gu_tensor = self.optimization_results[index][render_selection][
-                    batch_index
-                ]
-            print(gt_tensor.shape,
-                  gu_tensor.shape)
-
-            img = make_grid_overlay_batch(
-                background=gt_tensor.unsqueeze(0),
-                foreground=gu_tensor.unsqueeze(0),
-                alpha=self.cfg.render_images.alpha_overlay,
-                row=self.cfg.render_images.nrow,
-                final_width=self.cfg.render_images.final_width_batch,
-                add_background=self.cfg.render_images.add_background,
-                add_contour=self.cfg.render_images.add_countour,
-                color_countour=self.cfg.render_images.color_countour,
-                flip_result=self.cfg.render_images.flip_result,
-            )
-
-        return img
-
     def get_argmin(self):
         """
         Returns the argmin of all the losses put together
@@ -2133,52 +1328,6 @@ class DiffDope:
 
         return argmin
 
-    def make_animation(self, output_file_path=None,
-                       frame_rate=20, batch_index=-1):
-        """
-        Make an animation of the optimization to be saved. This uses the `render_img` function.
-
-        Args:
-            output_file_path (str): output path, if None, this goes into the hydra tmp folder.
-            frame_rate (int): video frame rate
-            batch_index (int): if -1 use argmin function.
-        """
-
-        if output_file_path is None:
-            hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
-            output_file_path = f"{hydra_cfg['runtime']['output_dir']}/animation.mp4"
-
-        # Set the frame rate (change this value as needed)
-        frame_rate = 10
-
-        # Get the dimensions of the first image (assuming all images have the
-        # same dimensions)
-        height, width = self.resolution
-
-        # Create a VideoWriter object to save the MP4 video (use 'XVID' codec
-        # for MP4)
-        writer = imageio.get_writer(
-            output_file_path,
-            mode="I",
-            fps=frame_rate,
-            codec="libx264",
-            bitrate="16M")
-
-        if batch_index == -1:
-            batch_index = self.get_argmin()
-
-        # Loop through the list of images and add each frame to the video
-        pbar = tqdm(range(self.cfg.hyperparameters.nb_iterations + 1))
-        for iteration_now in pbar:
-            pbar.set_description("making video")
-            # Ensure the image is in BGR format (OpenCV default)
-            img = self.render_img(index=iteration_now, batch_index=batch_index,
-                                  render_selection='rgb')
-            writer.append_data(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-        # Release the VideoWriter to save the MP4 video
-        writer.close()
-
     def add_loss_value(self, key, values, values_weighted=None):
         """
         Store in `losses_values` the values of different loss term at for all the objects
@@ -2197,51 +1346,6 @@ class DiffDope:
             self.losses_values[key] = torch.cat(
                 (self.losses_values[key], values.detach().unsqueeze(0)), dim=0
             )
-
-    def plot_losses(self, keys=None, batch_index=-1):
-        """
-        Plot the losses value
-
-        Args:
-            keys (list(str)): keys you want to plot, if None, all are plotted.
-            including_weighting (bool): do you want to include the weighting
-            batch_index (int): if -1 returns the argmin uses.
-
-        Returns:
-            returns a nd.array as image
-
-        """
-
-        if len(self.losses_values.keys()) == 0:
-            return None
-
-        if batch_index == -1:
-            batch_index = self.get_argmin()
-
-        plt.figure(figsize=(10, 6))  # Adjust the figure size as needed
-
-        # Plot the batch_index values as lines
-        for i, key in enumerate(self.losses_values.keys()):
-            plt.plot(
-                dcn(self.losses_values[key][..., batch_index]),
-                marker="o", label=key)
-        # plt.show()
-        plt.legend()
-
-        buffer = io.BytesIO()
-
-        # Save the plot to the buffer instead of a file
-        plt.savefig(buffer, format="png", bbox_inches="tight")
-        buffer.seek(0)
-
-        # Convert the PIL image to a NumPy array
-        pil_image = pilImage.open(buffer)
-        numpy_array = np.array(pil_image)
-        image_rgb = cv2.cvtColor(numpy_array, cv2.COLOR_BGR2RGB)
-        # Close the plot to release resources
-        plt.close()
-
-        return image_rgb
 
     def get_pose(self, batch_index=-1):
         """
@@ -2295,33 +1399,19 @@ class DiffDope:
 
         pbar = tqdm(range(self.cfg.hyperparameters.nb_iterations + 1))
 
-        # T0 = th.zeros((self.batchsize, 4, 4),
-                      # dtype=th.float32,
-                      # device=self.object3d.device)
-        # T0[..., 3, 3] = 1
+        T0 = th.zeros((self.batchsize, 4, 4),
+                      dtype=th.float32,
+                      device=self.object3d.device)
+        T0[..., 3, 3] = 1
         gbuf = th.ones((),
                        dtype=th.float32,
                        device=next(self.object3d.parameters()).device)
         result = self.object3d.mesh()
-        (posw, pos_idx,
-         uv, uv_idx, tex) = (
-                 result['posw'],
-                 result['pos_idx'],
-                 result['uv'],
-                 result['uv_idx'],
-                 result['tex']
-                 )
 
-        K = self.camera.cam_proj
-        w_r = self.cfg.losses.weight_rgb
-        w_d = self.cfg.losses.weight_depth
-        w_m = self.cfg.losses.weight_mask
-        # print(self.camera.cam_proj)
         for iteration_now in pbar:
             is_last_step = (iteration_now == self.cfg.hyperparameters.nb_iterations)
 
             with nvtx.annotate("iter"):
-                # == learning rates configuration ==
                 itf = iteration_now / self.cfg.hyperparameters.nb_iterations + 1
                 lr = (
                     self.cfg.hyperparameters.base_lr
@@ -2331,9 +1421,7 @@ class DiffDope:
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = lr
 
-                # == zero-grad  ==
                 self.optimizer.zero_grad(set_to_none=False)
-
                 #result.update(self.object3d())
                 # mtx_gu = result['T']
                 # se3 = self.se3 * self.scale
@@ -2342,9 +1430,8 @@ class DiffDope:
                 if True:#(not is_last_step): # fast-track
                     with torch.autograd.profiler.profile(False) as prof:
                         with nvtx.annotate("loss"):
-                            (loss, bloss), aux = loss_fn(
-                                    self.gt_tensors,
-                                    K,
+                            (loss, bloss), mtx_gu, rgb = loss_fn(self.gt_tensors,
+                                    self.camera.cam_proj,
                                     #result['T'],
 
                                     self.object3d.T0,
@@ -2352,33 +1439,27 @@ class DiffDope:
                                     self.object3d.scale,
                                     self.object3d.g,
 
-                                    posw,
-                                    pos_idx,
-                                    uv,
-                                    uv_idx,
-                                    tex,
-
+                                    result['posw'],
+                                    result['pos_idx'],
+                                    result['uv'],
+                                    result['uv_idx'],
+                                    result['tex'],
                                     self.learning_rates,
-                                    w_r,
-                                    w_d,
-                                    w_m,
+                                    self.cfg.losses.weight_rgb,
                                     self.resolution,
                                     self.glctx)
-                            #self.add_loss_value('rgb', bloss)
+                            self.add_loss_value('rgb', bloss)
 
                     #prof.export_chrome_trace('trace.json')
-                    # print(aux.keys())
 
-                    # to_add = {}
-                    # to_add.update({k:(v.detach() if isinstance(v,th.Tensor) else None) for k,v in aux.items()})
-                    # mtx_gu = aux['mtx'].detach()
-                    # to_add["rgb"] = rgb.detach()  # .cpu()
+                    to_add = {}
+                    to_add["rgb"] = rgb.detach()  # .cpu()
                     # if self.renders['depth'] is not None:
                     #     to_add["depth"] = self.renders["depth"].detach()  # .cpu()
                     # else:
                     #     to_add["depth"] = None
-                    # to_add["mtx"] = mtx_gu.detach()  # .cpu()
-                    # self.optimization_results.append(to_add)
+                    to_add["mtx"] = mtx_gu.detach()  # .cpu()
+                    self.optimization_results.append(to_add)
                 else:
                     # transform quat and position into a matrix44
                     # if 'quat' in result:
@@ -2468,24 +1549,7 @@ class DiffDope:
                     # prof.export_chrome_trace('trace.json')
                 with nvtx.annotate("opt.step"):
                     self.optimizer.step()
-
-                # option: (experimental) rotation-only...
-                # if True:
-                #     with th.no_grad():
-                #         self.object3d.se3[..., 3:6].fill_(0)
-
-                # option: apply T0
-                # alternatively just keep se3 as-is around the ref.point
-                if False:
-                    with th.no_grad():
-                        self.object3d.T0 = self.object3d.T0 @ SE3Exp(
-                            self.object3d.se3 * self.object3d.scale, 
-                            self.object3d.g)
-                        self.object3d.se3.fill_(0)
-                        # self.object3d.se3[..., 0:3].normal_(std=0.03)
-                        # self.object3d.se3[..., 3:6].normal_(std=0.003)
-        loss.item()
-        #print(loss)
+        print(loss)
 
     def cuda(self):
         """
